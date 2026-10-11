@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tapehead — multitrack audio studio</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<!-- Project manager -->
+<div id="home" class="screen">
+  <header class="home-top">
+    <div class="brand"><span class="brand-mark"></span>TAPEHEAD</div>
+    <input id="home-search" class="field" type="search" placeholder="Search projects" spellcheck="false">
+    <button id="home-new" class="btn accent">New project</button>
+  </header>
+  <main class="home-main">
+    <div class="home-head">
+      <h1>Projects</h1>
+      <span id="home-count" class="dim"></span>
+    </div>
+    <div id="home-grid" class="home-grid"></div>
+  </main>
+</div>
+
+<!-- Studio -->
+<div id="studio" class="screen" hidden>
+  <header id="topbar">
+    <button id="btn-home" class="tb-btn" title="Back to projects">
+      <svg viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z"/></svg>
+    </button>
+    <input id="proj-name" class="proj-name" spellcheck="false" title="Project name">
+    <span id="save-state" class="save-state">Saved</span>
+    <span class="tb-sep"></span>
+
+    <div class="seg" id="mode-seg" title="PAT loops the current beat pattern, SONG plays the playlist">
+      <button data-mode="pat">PAT</button><button data-mode="song">SONG</button>
+    </div>
+    <button id="btn-play" class="tb-btn play" title="Play / pause (Space)"></button>
+    <button id="btn-stop" class="tb-btn" title="Stop and return to start">
+      <svg viewBox="0 0 16 16"><path d="M3.5 3.5h9v9h-9z"/></svg>
+    </button>
+    <button id="btn-loop" class="tb-btn toggle" title="Loop region (Shift+drag on the ruler to set it)">
+      <svg viewBox="0 0 16 16"><path d="M4 5h7a2.5 2.5 0 010 5H9.5M12 11H5a2.5 2.5 0 010-5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+    </button>
+    <button id="btn-metro" class="tb-btn toggle" title="Metronome">
+      <svg viewBox="0 0 16 16"><path d="M6 2h4l2.5 12h-9zM8 10l4-6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>
+    </button>
+
+    <label class="lcd" title="Tempo (BPM)"><span>TEMPO</span><input id="bpm" type="number" min="40" max="300" step="1"></label>
+    <div class="lcd time" title="Position"><span>TIME</span><b id="lcd-time">0:00.00</b><i id="lcd-bar">1.1</i></div>
+    <span class="tb-sep"></span>
+
+    <div class="seg" id="tool-seg">
+      <button data-tool="select" title="Select / move / trim (V)">Select</button>
+      <button data-tool="slice" title="Slice clips (C)">Slice</button>
+      <button data-tool="mute" title="Mute clips (T)">Mute</button>
+      <button data-tool="delete" title="Delete clips (D)">Delete</button>
+    </div>
+    <label class="tb-field" title="Snap to grid (hold Alt to bypass)">SNAP
+      <select id="snap">
+        <option value="4">Bar</option><option value="1">Beat</option><option value="0.5">1/2 beat</option>
+        <option value="0.25">1/4 beat</option><option value="0">Off</option>
+      </select>
+    </label>
+    <button id="btn-undo" class="tb-btn" title="Undo (Ctrl+Z)">
+      <svg viewBox="0 0 16 16"><path d="M6 4L3 7l3 3M3.5 7H10a3 3 0 010 6H7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button id="btn-redo" class="tb-btn" title="Redo (Ctrl+Y)">
+      <svg viewBox="0 0 16 16"><path d="M10 4l3 3-3 3M12.500 7H6a3 3 0 000 6h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+
+    <span class="tb-grow"></span>
+    <div class="master" title="Master volume">
+      <span>MASTER</span>
+      <input id="master-vol" class="sl" type="range" min="0" max="1.25" step="0.01">
+      <canvas id="master-meter" width="110" height="6"></canvas>
+    </div>
+    <button id="btn-automix" class="btn" title="Analyse the tracks, then set levels, panning, effects and master loudness automatically">Auto mix</button>
+    <button id="btn-export" class="btn accent">Export WAV</button>
+  </header>
+
+  <div id="work">
+    <aside id="pool">
+      <div class="pane-head">
+        <span>SAMPLES</span>
+        <button id="pool-import" class="btn small">Import</button>
+      </div>
+      <div id="pool-list"></div>
+    </aside>
+
+    <section id="playlist">
+      <div id="pl-left">
+        <div id="pl-corner">
+          <span>PLAYLIST</span>
+          <span class="tb-grow"></span>
+          <button id="zoom-out" class="tb-btn tiny" title="Zoom out (Ctrl+wheel)">−</button>
+          <button id="zoom-in" class="tb-btn tiny" title="Zoom in (Ctrl+wheel)">+</button>
+        </div>
+        <div id="heads"><div id="heads-inner"></div></div>
+      </div>
+      <div id="tl-col">
+        <canvas id="ruler"></canvas>
+        <div id="tl-wrap">
+          <div id="tl-scroll"><div id="tl-spacer"></div></div>
+          <canvas id="tl-canvas"></canvas>
+        </div>
+        <div id="playhead"></div>
+      </div>
+    </section>
+  </div>
+
+  <section id="bottom">
+    <div id="bottom-grip" title="Drag to resize"></div>
+    <nav id="tabs">
+      <button data-tab="rack">Channel rack</button>
+      <button data-tab="mixer">Mixer &amp; effects</button>
+      <button data-tab="clip">Clip</button>
+      <span class="tb-grow"></span>
+      <span id="hint" class="hint"></span>
+    </nav>
+    <div id="tab-rack" class="tabpane"></div>
+    <div id="tab-mixer" class="tabpane" hidden></div>
+    <div id="tab-clip" class="tabpane" hidden></div>
+  </section>
+</div>
+
+<div id="busy" hidden><div class="busy-box"><span class="spin"></span><span id="busy-msg"></span></div></div>
+<div id="overlay"></div>
+<div id="toasts"></div>
+<input type="file" id="file-input" accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a" multiple hidden>
+
+<script src="js/util.js"></script>
+<script src="js/db.js"></script>
+<script src="js/kit.js"></script>
+<script src="js/fx.js"></script>
+<script src="js/engine.js"></script>
+<script src="js/playlist.js"></script>
+<script src="js/rack.js"></script>
+<script src="js/panels.js"></script>
+<script src="js/automix.js"></script>
+<script src="js/home.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

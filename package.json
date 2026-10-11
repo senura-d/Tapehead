@@ -1,0 +1,40 @@
+{
+  "name": "tapehead",
+  "version": "1.0.0",
+  "description": "Multitrack audio studio: edit WAV files, make beats, add effects, auto mix & master, export WAV.",
+  "author": "senura-d",
+  "private": true,
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.senurad.tapehead",
+    "productName": "Tapehead",
+    "files": [
+      "index.html",
+      "css/**",
+      "js/**",
+      "electron-main.js"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.music"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Audio"
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
+  }
+}

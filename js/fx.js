@@ -61,6 +61,12 @@ const FX = (() => {
         hp.connect(lo); lo.connect(mid); mid.connect(hi);
         return {
           in: hp, out: hi,
+          // combined magnitude response in dB at the given frequencies (for the EQ display)
+          curve(freqs) {
+            const mag = new Float32Array(freqs.length), ph = new Float32Array(freqs.length), out = new Float32Array(freqs.length);
+            for (const n of [hp, lo, mid, hi]) { n.getFrequencyResponse(freqs, mag, ph); for (let i = 0; i < out.length; i++) out[i] += 20 * Math.log10(mag[i] || 1e-6); }
+            return out;
+          },
           set(p) {
             setP(ctx, hp.frequency, p.hp); setP(ctx, lo.gain, p.low);
             setP(ctx, mid.gain, p.mid); setP(ctx, mid.frequency, p.midF); setP(ctx, hi.gain, p.high);
@@ -297,6 +303,7 @@ const FX = (() => {
     defs,
     order: ['eq', 'filter', 'comp', 'limiter', 'reverb', 'delay', 'dist', 'chorus', 'phaser', 'tremolo', 'bitcrush', 'utility'],
     setP,
+    h: { wetDry, lfo, biquad },
     make(type) {
       const p = {};
       for (const d of defs[type].params) p[d.k] = d.def;

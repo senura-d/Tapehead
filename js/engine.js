@@ -1,9 +1,11 @@
 'use strict';
 
 // Audio engine: decoded buffers, the live mixer graph, transport, and offline rendering.
-// Signal path: clip -> track input -> track FX -> pan -> volume -> master input -> master FX -> master volume -> out
+// Signal path: clip -> track input -> track FX -> pan -> automation gain -> volume -> bus or master
+//              master input -> master FX -> master volume -> out
 const Engine = {
   ctx: null,
+  ready: null,          // resolves once worklets are loaded on the live context
   buffers: new Map(),   // sampleId -> AudioBuffer
   reversed: new Map(),  // sampleId -> reversed AudioBuffer
   peaks: new Map(),     // sampleId[~r] -> {min, max, rate}
@@ -22,6 +24,7 @@ const Engine = {
     if (!this.ctx) {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
       Kit.build(this.ctx, this.buffers);
+      this.ready = Worklets.add(this.ctx);
     }
     return this.ctx;
   },
@@ -80,29 +83,57 @@ const Engine = {
   /* ---------- graph ---------- */
 
   makeStrip(ctx, live) {
-    const s = { input: ctx.createGain(), fxOut: ctx.createGain(), pan: ctx.createStereoPanner(), vol: ctx.createGain(), fx: [], analyser: null, level: 0 };
-    s.fxOut.connect(s.pan); s.pan.connect(s.vol);
+    const s = {
+      input: ctx.createGain(), fxOut: ctx.createGain(), pan: ctx.createStereoPanner(), auto: ctx.createGain(),
+      vol: ctx.createGain(), send: ctx.createGain(), fx: [], analyser: null, level: 0, dest: null, sendDest: null,
+    };
+    s.fxOut.connect(s.pan); s.pan.connect(s.auto); s.auto.connect(s.vol); s.vol.connect(s.send);
     if (live) {
       s.analyser = ctx.createAnalyser();
-      s.analyser.fftSize = 512;
+      s.analyser.fftSize = 2048;
+      s.analyser.smoothingTimeConstant = 0.75;
       s.vol.connect(s.analyser);
     }
     return s;
   },
 
+  killFx(strip) {
+    for (const f of strip.fx) {
+      if (f.keySrc) { try { f.keySrc.disconnect(f.inst.key); } catch (e) { /* already gone */ } }
+      f.inst.out.disconnect();
+      if (f.inst.stop) f.inst.stop();
+    }
+    strip.fx = [];
+  },
+
   wireFx(ctx, strip, list, env) {
     strip.input.disconnect();
-    for (const f of strip.fx) { f.inst.out.disconnect(); if (f.inst.stop) f.inst.stop(); }
-    strip.fx = [];
+    this.killFx(strip);
     let node = strip.input;
     for (const fx of list) {
-      if (!fx.on) continue;
+      if (!fx.on || !FX.defs[fx.type]) continue;
       const inst = FX.instance(ctx, fx, env);
       node.connect(inst.in);
       node = inst.out;
-      strip.fx.push({ id: fx.id, inst });
+      strip.fx.push({ id: fx.id, inst, fx, keySrc: null });
     }
     node.connect(strip.fxOut);
+  },
+
+  // Feed sidechain effects from the track they name as their trigger.
+  linkKeys(g, p) {
+    const strips = [['master', g.master], ...g.tracks];
+    for (const [owner, s] of strips) {
+      for (const f of s.fx) {
+        if (!f.inst.key) continue;
+        const srcId = f.fx.p.src, src = srcId && srcId !== owner && p.tracks.some(t => t.id === srcId) ? g.tracks.get(srcId) : null;
+        const want = src ? src.fxOut : null;
+        if (f.keySrc === want) continue;
+        if (f.keySrc) { try { f.keySrc.disconnect(f.inst.key); } catch (e) { /* already gone */ } }
+        if (want) want.connect(f.inst.key);
+        f.keySrc = want;
+      }
+    }
   },
 
   buildGraph(ctx, p, live) {
@@ -114,42 +145,63 @@ const Engine = {
   },
 
   applyMix(g, p) {
-    const anySolo = p.tracks.some(t => t.solo), seen = new Set();
+    const byId = new Map(p.tracks.map(t => [t.id, t])), anySolo = p.tracks.some(t => t.solo);
     for (const t of p.tracks) {
-      seen.add(t.id);
-      let s = g.tracks.get(t.id);
-      if (!s) {
-        s = this.makeStrip(g.ctx, g.live);
-        s.vol.connect(g.master.input);
-        this.wireFx(g.ctx, s, t.fx, { bpm: p.bpm });
-        g.tracks.set(t.id, s);
-      }
-      FX.setP(g.ctx, s.pan.pan, t.pan);
-      FX.setP(g.ctx, s.vol.gain, t.mute || (anySolo && !t.solo) ? 0 : t.vol);
+      if (g.tracks.has(t.id)) continue;
+      const s = this.makeStrip(g.ctx, g.live);
+      this.wireFx(g.ctx, s, t.fx, { bpm: p.bpm });
+      g.tracks.set(t.id, s);
     }
-    for (const [id, s] of g.tracks) if (!seen.has(id)) { s.vol.disconnect(); g.tracks.delete(id); }
+    for (const [id, s] of g.tracks) {
+      if (byId.has(id)) continue;
+      s.vol.disconnect(); s.send.disconnect();
+      this.killFx(s);
+      g.tracks.delete(id);
+    }
+    const busOf = id => { const b = id ? byId.get(id) : null; return b && b.bus ? b : null; };
+    for (const t of p.tracks) {
+      const s = g.tracks.get(t.id), bus = t.bus ? null : busOf(t.out), sendBus = t.bus ? null : busOf(t.send.to);
+      const dest = (bus ? g.tracks.get(bus.id) : g.master).input;
+      if (s.dest !== dest) { if (s.dest) s.vol.disconnect(s.dest); s.vol.connect(dest); s.dest = dest; }
+      const sd = sendBus ? g.tracks.get(sendBus.id).input : null;
+      if (s.sendDest !== sd) { if (s.sendDest) s.send.disconnect(s.sendDest); if (sd) s.send.connect(sd); s.sendDest = sd; }
+      FX.setP(g.ctx, s.send.gain, sd ? t.send.amt : 0);
+      // soloing a track keeps the buses it feeds audible, and soloing a bus keeps its members
+      const soloed = t.solo || (bus && bus.solo)
+        || (t.bus && p.tracks.some(c => c.solo && (c.out === t.id || c.send.to === t.id)));
+      if (!t.auto.pan.length) FX.setP(g.ctx, s.pan.pan, t.pan);
+      FX.setP(g.ctx, s.vol.gain, t.mute || (anySolo && !soloed) ? 0 : t.vol);
+    }
     FX.setP(g.ctx, g.master.vol.gain, p.master.vol);
+    this.linkKeys(g, p);
   },
 
   setProject(p) {
     this.ensure();
     if (this.graph) {
       this.graph.master.vol.disconnect();
-      for (const s of [this.graph.master, ...this.graph.tracks.values()]) for (const f of s.fx) if (f.inst.stop) f.inst.stop();
+      for (const s of [this.graph.master, ...this.graph.tracks.values()]) this.killFx(s);
     }
     this.project = p;
     this.mode = p.mode;
     this.graph = this.buildGraph(this.ctx, p, true);
+    this.settleAuto(this.pos);
   },
 
   strip(owner) { return owner === 'master' ? this.graph.master : this.graph.tracks.get(owner); },
   fxList(p, owner) { return owner === 'master' ? p.master.fx : (p.tracks.find(t => t.id === owner) || { fx: [] }).fx; },
 
-  syncMix() { if (this.graph) this.applyMix(this.graph, this.project); },
+  syncMix() {
+    if (!this.graph) return;
+    this.applyMix(this.graph, this.project);
+    if (!this.playing || this.mode !== 'song') this.settleAuto(this.pos);
+  },
 
   rebuildFx(owner) {
     const s = this.strip(owner);
-    if (s) this.wireFx(this.ctx, s, this.fxList(this.project, owner), { bpm: this.project.bpm });
+    if (!s) return;
+    this.wireFx(this.ctx, s, this.fxList(this.project, owner), { bpm: this.project.bpm });
+    this.linkKeys(this.graph, this.project);
   },
   rebuildAllFx() {
     this.rebuildFx('master');
@@ -157,27 +209,95 @@ const Engine = {
   },
   updateFx(owner, fx) {
     const s = this.strip(owner), f = s && s.fx.find(x => x.id === fx.id);
-    if (f) f.inst.set(fx.p);
+    if (f) { f.inst.set(fx.p); this.linkKeys(this.graph, this.project); }
+  },
+
+  /* ---------- automation ---------- */
+
+  // Value of a point curve at time t (points sorted by t; flat before the first and after the last).
+  interp(pts, t, def) {
+    if (!pts || !pts.length) return def;
+    if (t <= pts[0].t) return pts[0].v;
+    for (let i = 1; i < pts.length; i++) {
+      if (t <= pts[i].t) {
+        const a = pts[i - 1], b = pts[i];
+        return b.t === a.t ? b.v : a.v + (b.v - a.v) * (t - a.t) / (b.t - a.t);
+      }
+    }
+    return pts[pts.length - 1].v;
+  },
+
+  // Play a point curve on an AudioParam: curve time `from` happens at context time `when`.
+  autoSchedule(param, pts, from, when, def) {
+    param.cancelScheduledValues(0);
+    param.setValueAtTime(this.interp(pts, from, def), when);
+    for (const pt of pts) if (pt.t > from) param.linearRampToValueAtTime(pt.v, when + pt.t - from);
+  },
+
+  scheduleAuto(g, p, t0, from) {
+    for (const t of p.tracks) {
+      const s = g.tracks.get(t.id);
+      if (t.auto.vol.length) this.autoSchedule(s.auto.gain, t.auto.vol, from, t0, 1);
+      if (t.auto.pan.length) this.autoSchedule(s.pan.pan, t.auto.pan, from, t0, t.pan);
+    }
+  },
+
+  // While stopped, hold every automated control at its value for the playhead position.
+  settleAuto(pos) {
+    const g = this.graph, p = this.project;
+    if (!g || !p) return;
+    for (const t of p.tracks) {
+      const s = g.tracks.get(t.id);
+      if (!s) continue;
+      s.auto.gain.cancelScheduledValues(0);
+      s.auto.gain.value = this.interp(t.auto.vol, pos, 1);
+      if (t.auto.pan.length) { s.pan.pan.cancelScheduledValues(0); s.pan.pan.value = this.interp(t.auto.pan, pos, t.pan); }
+    }
   },
 
   /* ---------- scheduling ---------- */
 
+  // Calls fn(channel, position, velocity, pitch, lengthInSteps) for every hit of a pattern
+  // between step positions a and b. Positions keep counting past the pattern end (it loops).
+  patEvents(p, pat, a, b, fn) {
+    const n = pat.steps;
+    for (let k = Math.floor(a); k < b; k++) {
+      const st = ((k % n) + n) % n, sw = st % 2 ? p.swing * 0.5 : 0;
+      for (const ch of pat.channels) {
+        const v = ch.steps[st];
+        if (ch.mute || !v) continue;
+        const rolls = ch.rolls[st] || 1;
+        for (let j = 0; j < rolls; j++) {
+          const pos = k + sw + j / rolls * (1 - sw);
+          if (pos >= a && pos < b) fn(ch, pos, j ? v * 0.8 : v, ch.pitch || 0, 0);
+        }
+      }
+    }
+    for (let loop = Math.floor(a / n); loop * n < b; loop++) {
+      for (const ch of pat.channels) {
+        if (ch.mute) continue;
+        for (const nt of ch.notes) {
+          const pos = loop * n + nt.t;
+          if (nt.t < n && pos >= a && pos < b) fn(ch, pos, nt.vel, (ch.pitch || 0) + nt.pitch, Math.min(nt.len, n - nt.t));
+        }
+      }
+    }
+  },
+
   // Schedule every clip that sounds after playlist time `from`, with context time t0 == `from`.
   scheduleClips(g, p, t0, from, to, sink) {
-    const ctx = g.ctx;
+    const ctx = g.ctx, sd = 60 / p.bpm / 4;
     for (const c of p.clips) {
       if (c.mute) continue;
-      const buf = this.getBuffer(c.sampleId, c.reverse), strip = g.tracks.get(c.trackId);
-      if (!buf || !strip) continue;
+      const strip = g.tracks.get(c.trackId), isPat = c.kind === 'pattern';
+      const buf = isPat ? null : this.getBuffer(c.sampleId, c.reverse), pat = isPat ? p.patterns.find(x => x.id === c.patId) : null;
+      if (!strip || (!buf && !pat)) continue;
       const dur = c.len / c.rate, end = c.start + dur;
       if (end <= from + 1e-4 || (to != null && c.start >= to)) continue;
       const into = Math.max(0, from - c.start), when = t0 + Math.max(0, c.start - from), rem = dur - into;
 
-      const src = ctx.createBufferSource(), gn = ctx.createGain();
-      src.buffer = buf;
-      src.playbackRate.value = c.rate;
-      src.connect(gn); gn.connect(strip.input);
-
+      // fades
+      const gn = ctx.createGain();
       const fi = Math.min(c.fadeIn || 0, dur), fo = Math.min(c.fadeOut || 0, dur - fi);
       const env = t => c.gain * Math.min(1, fi > 0 ? t / fi : 1, fo > 0 ? (dur - t) / fo : 1);
       gn.gain.setValueAtTime(env(into), when);
@@ -187,7 +307,24 @@ const Engine = {
         if (into < fs) gn.gain.setValueAtTime(env(fs), when + fs - into);
         gn.gain.linearRampToValueAtTime(0, when + rem);
       }
+      // drawn gain envelope
+      let out = gn;
+      if (c.env && c.env.length) {
+        out = ctx.createGain();
+        gn.connect(out);
+        this.autoSchedule(out.gain, c.env, into, when, 1);
+      }
+      out.connect(strip.input);
 
+      if (isPat) {
+        const cut = to != null && end > to ? to - c.start : dur, a = (c.offset + into) / sd, b = (c.offset + cut) / sd;
+        this.patEvents(p, pat, a, b, (ch, pos, vel, pitch, len) => this.trigger(ctx, ch, when + (pos - a) * sd, gn, sink, vel, pitch, len * sd));
+        continue;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.playbackRate.value = c.rate;
+      src.connect(gn);
       src.start(when, c.offset + into * c.rate, rem * c.rate);
       if (to != null && end > to) src.stop(t0 + to - from);
       if (sink) this.track(src, sink);
@@ -199,16 +336,24 @@ const Engine = {
     src.onended = () => sink.delete(src);
   },
 
-  trigger(ctx, ch, time, dest, sink) {
+  // Play one hit of a rack channel. lenSec > 0 cuts the sample off after that long (piano-roll notes).
+  trigger(ctx, ch, time, dest, sink, vel, pitch, lenSec) {
     const buf = this.getBuffer(ch.sampleId);
     if (!buf) return;
-    const src = ctx.createBufferSource(), g = ctx.createGain(), pan = ctx.createStereoPanner();
+    const src = ctx.createBufferSource(), g = ctx.createGain();
     src.buffer = buf;
-    src.playbackRate.value = Math.pow(2, (ch.pitch || 0) / 12);
-    g.gain.value = ch.vol;
-    pan.pan.value = ch.pan || 0;
-    src.connect(g); g.connect(pan); pan.connect(dest);
+    src.playbackRate.value = Math.pow(2, (pitch == null ? ch.pitch || 0 : pitch) / 12);
+    const level = ch.vol * (vel == null ? 1 : vel);
+    g.gain.value = level;
+    src.connect(g);
+    if (ch.pan) { const pan = ctx.createStereoPanner(); pan.pan.value = ch.pan; g.connect(pan); pan.connect(dest); }
+    else g.connect(dest);
     src.start(time);
+    if (lenSec > 0) {
+      g.gain.setValueAtTime(level, time + lenSec);
+      g.gain.linearRampToValueAtTime(0, time + lenSec + 0.03);
+      src.stop(time + lenSec + 0.04);
+    }
     if (sink) this.track(src, sink);
   },
 
@@ -229,45 +374,47 @@ const Engine = {
   play(from) {
     const ctx = this.ensure(), p = this.project;
     if (ctx.state === 'suspended') ctx.resume();
-    this.halt();
+    this.halt(true);
     this.playing = true;
     this.p0 = from != null ? from : this.pos;
     this.t0 = ctx.currentTime + 0.06;
     if (this.mode === 'song') {
+      this.scheduleAuto(this.graph, p, this.t0, this.p0);
       this.scheduleClips(this.graph, p, this.t0, this.p0, null, this.sources);
       this.metroNext = Math.ceil(this.p0 / (60 / p.bpm) - 1e-6);
     } else {
       this.patStep = 0;
-      this.patTime = this.t0;
       this.stepQ = [];
     }
     this.timer = setInterval(() => this.tick(), 25);
     this.tick();
   },
 
-  halt() {
+  halt(restarting) {
     clearInterval(this.timer);
     for (const s of this.sources) { s.onended = null; try { s.stop(); } catch (e) { /* not started */ } s.disconnect(); }
     this.sources.clear();
     this.playing = false;
+    if (!restarting) this.settleAuto(this.pos);
   },
 
   pause() {
     if (!this.playing) return;
     const at = this.position();
-    this.halt();
     if (this.mode === 'song') this.pos = at;
+    this.halt();
   },
 
   stop() {
-    this.halt();
     const l = this.project && this.project.loop;
     this.pos = l && l.on && l.end > l.start ? l.start : 0;
+    this.halt();
   },
 
   seek(t) {
     this.pos = Math.max(0, t);
     if (this.playing && this.mode === 'song') this.play(this.pos);
+    else this.settleAuto(this.pos);
   },
 
   // Re-schedule after the arrangement changed mid-playback.
@@ -288,22 +435,22 @@ const Engine = {
     const ctx = this.ctx, p = this.project, horizon = ctx.currentTime + 0.12;
     if (this.mode === 'pat') {
       const pat = this.curPattern(p), sd = 60 / p.bpm / 4;
-      while (this.patTime < horizon) {
-        const st = this.patStep % pat.steps, t = this.patTime + (st % 2 ? p.swing * sd * 0.5 : 0);
-        for (const ch of pat.channels) if (!ch.mute && ch.steps[st]) this.trigger(ctx, ch, t, this.graph.master.input, this.sources);
-        if (p.metro && st % 4 === 0) this.click(this.patTime, st === 0);
-        this.stepQ.push({ step: st, time: this.patTime });
+      while (this.t0 + this.patStep * sd < horizon) {
+        const k = this.patStep, time = this.t0 + k * sd, st = k % pat.steps;
+        this.patEvents(p, pat, k, k + 1, (ch, pos, vel, pitch, len) =>
+          this.trigger(ctx, ch, this.t0 + pos * sd, this.graph.master.input, this.sources, vel, pitch, len * sd));
+        if (p.metro && st % 4 === 0) this.click(time, st === 0);
+        this.stepQ.push({ step: st, time });
         this.patStep++;
-        this.patTime += sd;
       }
       return;
     }
     const pos = this.position(), l = p.loop, end = this.songEnd(p);
     if (l.on && l.end > l.start + 0.05) {
       if (pos >= l.end) return this.play(l.start);
-    } else if (end > 0 && pos > end + 0.5) {
-      this.halt();
+    } else if (end > 0 && pos > end + 0.5 && !this.recording) {
       this.pos = 0;
+      this.halt();
       return;
     }
     if (p.metro) {
@@ -316,12 +463,12 @@ const Engine = {
   },
 
   // Audition a sample or rack channel immediately.
-  preview(ch) {
+  preview(ch, pitch, lenSec) {
     const ctx = this.ensure();
     if (ctx.state === 'suspended') ctx.resume();
     if (this.previewSrc) { try { this.previewSrc.stop(); } catch (e) { /* ended */ } }
     const sink = new Set();
-    this.trigger(ctx, ch, ctx.currentTime + 0.01, this.graph ? this.graph.master.input : ctx.destination, sink);
+    this.trigger(ctx, ch, ctx.currentTime + 0.01, this.graph ? this.graph.master.input : ctx.destination, sink, 1, pitch, lenSec || 0);
     this.previewSrc = [...sink][0];
   },
 
@@ -330,16 +477,15 @@ const Engine = {
   async renderPattern(p, pat, repeats) {
     const sr = this.ctx.sampleRate, sd = 60 / p.bpm / 4, loopLen = pat.steps * sd * repeats;
     const off = new OfflineAudioContext(2, Math.ceil((loopLen + 1.5) * sr), sr);
-    for (let i = 0; i < pat.steps * repeats; i++) {
-      const st = i % pat.steps, t = i * sd + (st % 2 ? p.swing * sd * 0.5 : 0);
-      for (const ch of pat.channels) if (!ch.mute && ch.steps[st]) this.trigger(off, ch, t, off.destination);
-    }
+    this.patEvents(p, pat, 0, pat.steps * repeats, (ch, pos, vel, pitch, len) => this.trigger(off, ch, pos * sd, off.destination, null, vel, pitch, len * sd));
     return { buf: await off.startRendering(), loopLen };
   },
 
   async renderSong(p, { sampleRate, from, to, tail }) {
-    const off = new OfflineAudioContext(2, Math.ceil((to - from + tail) * sampleRate), sampleRate);
+    const off = new OfflineAudioContext(2, Math.max(1, Math.ceil((to - from + tail) * sampleRate)), sampleRate);
+    await Worklets.add(off);
     const g = this.buildGraph(off, p, false);
+    this.scheduleAuto(g, p, 0, from);
     this.scheduleClips(g, p, 0, from, to, null);
     return off.startRendering();
   },

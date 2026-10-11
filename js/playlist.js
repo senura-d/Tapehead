@@ -25,7 +25,12 @@ const Playlist = {
     sc.addEventListener('pointermove', e => this.onMove(e));
     sc.addEventListener('pointerup', e => this.onUp(e));
     sc.addEventListener('pointercancel', e => this.onUp(e));
-    sc.addEventListener('dblclick', e => { if (this.hit(...this.xy(e))) App.setTab('clip'); });
+    sc.addEventListener('dblclick', e => {
+      const h = this.hit(...this.xy(e));
+      if (!h || App.tool !== 'select') return;
+      if (h.clip.kind === 'pattern') { App.project.curPat = h.clip.patId; App.setTab('rack'); Rack.render(); }
+      else App.setTab('clip');
+    });
     sc.addEventListener('contextmenu', e => this.onMenu(e));
     sc.addEventListener('wheel', e => {
       if (!e.ctrlKey && !e.metaKey) return;
@@ -42,18 +47,31 @@ const Playlist = {
     const rt = e => this.snap(Math.max(0, this.x2t(e.clientX - rl.getBoundingClientRect().left)), e);
     rl.addEventListener('pointerdown', e => {
       rl.setPointerCapture(e.pointerId);
+      const mk = this.markerAt(e);
+      if (mk) { App.pushUndo(); rdrag = { mk }; return; }
       rdrag = e.shiftKey ? { a: rt(e) } : {};
       if (!e.shiftKey) App.seek(rt(e));
     });
     rl.addEventListener('pointermove', e => {
       if (!rdrag) return;
+      if (rdrag.mk) { rdrag.mk.t = rt(e); return this.draw(); }
       if (rdrag.a == null) return App.seek(rt(e));
       const b = rt(e), p = App.project;
       p.loop = { on: true, start: Math.min(rdrag.a, b), end: Math.max(rdrag.a, b) };
       App.syncTop();
       this.draw();
     });
-    rl.addEventListener('pointerup', () => { if (rdrag && rdrag.a != null) App.touch(); rdrag = null; });
+    rl.addEventListener('pointerup', () => { if (rdrag && (rdrag.a != null || rdrag.mk)) App.touch(); rdrag = null; });
+    rl.addEventListener('dblclick', e => { if (!this.markerAt(e)) App.addMarker(rt(e)); });
+    rl.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      const m = this.markerAt(e), p = App.project;
+      if (!m) return UI.menu(e.clientX, e.clientY, [{ label: 'Add marker here', onclick: () => App.addMarker(rt(e)) }]);
+      UI.menu(e.clientX, e.clientY, [
+        { label: 'Rename marker', onclick: async () => { const n = await UI.prompt('Marker name', m.name); if (n) App.edit(() => { m.name = n; }, 'timeline'); } },
+        { label: 'Delete marker', danger: true, onclick: () => App.edit(() => { p.markers = p.markers.filter(x => x !== m); }, 'timeline') },
+      ]);
+    });
 
     // drag samples (from the pool) or audio files (from the OS) onto the timeline
     sc.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
@@ -123,6 +141,14 @@ const Playlist = {
       if (y > H || y + TH < 0) return;
       g.fillStyle = t.id === App.selTrack ? '#1c2024' : i % 2 ? '#171a1d' : '#15181b';
       g.fillRect(0, y, W, TH - 1);
+      if (t.bus) {
+        g.fillStyle = 'rgba(157,140,255,0.05)';
+        g.fillRect(0, y, W, TH - 1);
+        g.fillStyle = 'rgba(255,255,255,0.22)';
+        g.font = '11px "Segoe UI", system-ui, sans-serif';
+        g.textBaseline = 'middle';
+        g.fillText('Bus — tracks routed here share this fader and effect chain (right-click a track → Output)', 12, y + TH / 2);
+      }
     });
 
     // grid: pick the finest subdivision that stays readable at this zoom
@@ -143,6 +169,19 @@ const Playlist = {
     for (const c of p.clips) {
       const row = rowOf.get(c.trackId);
       if (row != null) this.drawClip(g, c, p.tracks[row], row * TH - sy, sx, pps, W, H);
+    }
+
+    const autoOn = App.tool === 'auto';
+    p.tracks.forEach((t, i) => {
+      for (const prm of ['vol', 'pan']) {
+        const pts = t.auto[prm], active = autoOn && App.autoParam === prm;
+        if (!pts.length && !active) continue;
+        this.drawCurve(g, pts, prm === 'vol' ? 1 : t.pan, v => this.autoY(prm, v, i * TH - sy), tt => tt * pps - sx, 0, W, active, prm === 'vol' ? '#6fdc8c' : '#4fc3f7');
+      }
+    });
+    for (const m of p.markers) {
+      g.fillStyle = 'rgba(157,140,255,0.35)';
+      g.fillRect(Math.round(m.t * pps - sx), 0, 1, bottom);
     }
 
     if (p.loop.end > p.loop.start) {
@@ -181,8 +220,10 @@ const Playlist = {
     g.fillRect(x, y, w, T);
 
     const x0 = Math.max(0, Math.floor(x)), x1 = Math.min(W, Math.ceil(x + w));
-    const pk = Engine.getPeaks(c.sampleId, c.reverse);
-    if (pk) {
+    const isPat = c.kind === 'pattern', pat = isPat ? App.project.patterns.find(q => q.id === c.patId) : null;
+    const pk = isPat ? null : Engine.getPeaks(c.sampleId, c.reverse);
+    if (pat) this.drawPattern(g, c, pat, x, y + T, h - T, pps, x0, x1, col);
+    else if (pk) {
       const mid = y + T + (h - T) / 2, amp = (h - T - 4) / 2, gain = Math.min(c.gain, 2), last = pk.min.length - 1;
       g.fillStyle = U.hexA(col, 0.95);
       for (let px = x0; px < x1; px++) {
@@ -196,7 +237,7 @@ const Playlist = {
     } else {
       g.fillStyle = 'rgba(255,255,255,0.5)';
       g.font = '11px system-ui';
-      g.fillText('missing audio', Math.max(x, 0) + 6, y + T + 16);
+      g.fillText(isPat ? 'pattern deleted' : 'missing audio', Math.max(x, 0) + 6, y + T + 16);
     }
 
     // fades: shade the faded-out area
@@ -208,7 +249,11 @@ const Playlist = {
       g.fillStyle = '#0d0f11';
       g.font = '600 10.5px "Segoe UI", system-ui, sans-serif';
       g.textBaseline = 'middle';
-      g.fillText((c.reverse ? '◂ ' : '') + c.name, Math.max(x, 0) + 5, y + T / 2 + 0.5);
+      g.fillText((c.reverse ? '◂ ' : '') + (pat ? '▦ ' + pat.name : c.name), Math.max(x, 0) + 5, y + T / 2 + 0.5);
+    }
+    const envOn = App.tool === 'auto' && App.autoParam === 'clip';
+    if (c.env.length || envOn) {
+      this.drawCurve(g, c.env, 1, v => this.clipEnvY(v, y, h), tt => x + tt * pps, x, x + w, envOn, '#ffffff');
     }
     if (sel && w > 34) {
       // fade handles
@@ -225,6 +270,85 @@ const Playlist = {
     }
   },
 
+  // step dots for a live pattern clip
+  drawPattern(g, c, pat, x, y, h, pps, x0, x1, col) {
+    const p = App.project, sd = 60 / p.bpm / 4, n = Math.max(1, pat.channels.length), rh = h / n, sw = sd * pps;
+    const loop = pat.steps * sw;
+    g.fillStyle = 'rgba(0,0,0,0.3)';
+    for (let lx = x - (c.offset * pps) % loop; lx < x1; lx += loop) if (lx > x + 1) g.fillRect(Math.round(lx), y, 1, h);
+    if (sw < 1.2) return;
+    g.fillStyle = U.hexA(col, 0.95);
+    const a = (c.offset + (x0 - x) / pps) / sd, b = (c.offset + (x1 - x) / pps) / sd;
+    Engine.patEvents(p, pat, a, b, (ch, pos, vel, pitch, len) => {
+      const row = pat.channels.indexOf(ch), px = x + (pos * sd - c.offset) * pps;
+      g.globalAlpha = (c.mute ? 0.32 : 1) * (0.4 + 0.6 * vel);
+      g.fillRect(px, y + row * rh + 1, Math.max(2, (len || 0.45) * sw - 1), Math.max(2, rh - 2));
+    });
+    g.globalAlpha = c.mute ? 0.32 : 1;
+  },
+
+  // a point curve (automation or clip gain): yOf maps value to y, xOf maps time to x
+  drawCurve(g, pts, def, yOf, xOf, xa, xb, active, color) {
+    g.save();
+    g.globalAlpha = active ? 1 : 0.5;
+    g.strokeStyle = color; g.fillStyle = color; g.lineWidth = active ? 1.5 : 1;
+    g.beginPath();
+    g.moveTo(xa, yOf(pts.length ? pts[0].v : def));
+    for (const pt of pts) g.lineTo(xOf(pt.t), yOf(pt.v));
+    g.lineTo(xb, yOf(pts.length ? pts[pts.length - 1].v : def));
+    g.stroke();
+    if (active) for (const pt of pts) { g.beginPath(); g.arc(xOf(pt.t), yOf(pt.v), 3.5, 0, Math.PI * 2); g.fill(); }
+    g.restore();
+  },
+
+  autoY(prm, v, rowY) {
+    return prm === 'vol' ? rowY + this.TH - 5 - v / 1.25 * (this.TH - 10) : rowY + this.TH / 2 - v * (this.TH / 2 - 5);
+  },
+  clipEnvY(v, y, h) { return y + h - 3 - v / 2 * (h - this.TITLE - 6); },
+
+  // What the automation tool edits at a viewport point: a track curve or a clip's gain envelope.
+  autoTarget(x, y) {
+    const p = App.project, sy = this.sc.scrollTop, sx = this.sc.scrollLeft, pps = this.pps, TH = this.TH;
+    const row = Math.floor((y + sy) / TH), tr = p.tracks[row], prm = App.autoParam, rowY = row * TH - sy;
+    if (!tr) return null;
+    if (prm === 'clip') {
+      const h = this.hit(x, y);
+      if (!h) return null;
+      const c = h.clip, cy = rowY + 2, ch = TH - 5, dur = this.dur(c);
+      return {
+        pts: c.env, xOf: t => (c.start + t) * pps - sx, tOf: X => U.clamp((X + sx) / pps - c.start, 0, dur),
+        yOf: v => this.clipEnvY(v, cy, ch), vOf: Y => U.clamp((cy + ch - 3 - Y) / (ch - this.TITLE - 6) * 2, 0, 2),
+      };
+    }
+    return {
+      pts: tr.auto[prm], xOf: t => t * pps - sx, tOf: (X, e) => Math.max(0, this.snap((X + sx) / pps, e)),
+      yOf: v => this.autoY(prm, v, rowY),
+      vOf: Y => (prm === 'vol' ? U.clamp((rowY + TH - 5 - Y) / (TH - 10) * 1.25, 0, 1.25) : U.clamp((rowY + TH / 2 - Y) / (TH / 2 - 5), -1, 1)),
+    };
+  },
+  autoHit(tg, x, y) { return tg.pts.find(pt => Math.abs(tg.xOf(pt.t) - x) < 7 && Math.abs(tg.yOf(pt.v) - y) < 7); },
+
+  autoDown(e, x, y) {
+    const tg = this.autoTarget(x, y);
+    if (!tg) return;
+    this.sc.setPointerCapture(e.pointerId);
+    App.pushUndo();
+    let pt = this.autoHit(tg, x, y);
+    if (!pt) {
+      pt = { t: tg.tOf(x, e), v: Math.round(tg.vOf(y) * 100) / 100 };
+      tg.pts.push(pt);
+      tg.pts.sort((a, b) => a.t - b.t);
+    }
+    this.drag = { kind: 'auto', tg, pt, moved: true };
+    this.draw();
+  },
+
+  markerAt(e) {
+    const r = this.ruler.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+    if (y > 15) return null;
+    return App.project.markers.find(m => { const mx = m.t * this.pps - this.sc.scrollLeft; return x >= mx - 3 && x <= mx + 10 + m.name.length * 6.2; });
+  },
+
   drawRuler() {
     const p = App.project, g = this.rx, W = this.vw, sx = this.sc.scrollLeft, pps = p.view.pps, bar = 240 / p.bpm;
     g.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -233,6 +357,15 @@ const Playlist = {
       g.fillStyle = p.loop.on ? 'rgba(255,138,42,0.75)' : 'rgba(255,255,255,0.15)';
       g.fillRect(p.loop.start * pps - sx, 0, (p.loop.end - p.loop.start) * pps, 5);
     }
+    g.font = '600 9.5px "Segoe UI", system-ui, sans-serif';
+    g.textBaseline = 'middle';
+    for (const m of p.markers) {
+      const mx = Math.round(m.t * pps - sx), tw = g.measureText(m.name).width + 8;
+      g.fillStyle = '#9d8cff';
+      g.fillRect(mx, 0, tw, 12); g.fillRect(mx, 0, 1, 28);
+      g.fillStyle = '#12101f';
+      g.fillText(m.name, mx + 4, 6.5);
+    }
     const every = [1, 2, 4, 8, 16, 32, 64, 128].find(n => n * bar * pps >= 46) || 256;
     g.font = '10.5px "Cascadia Mono", Consolas, monospace';
     g.textBaseline = 'middle';
@@ -240,8 +373,8 @@ const Playlist = {
       const x = Math.round(k * bar * pps - sx) + 0.5, major = k % every === 0;
       if (!major && bar * pps < 7) continue;
       g.strokeStyle = major ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.12)';
-      g.beginPath(); g.moveTo(x, major ? 16 : 22); g.lineTo(x, 28); g.stroke();
-      if (major) { g.fillStyle = '#8b959e'; g.fillText(k + 1, x + 4, 13); }
+      g.beginPath(); g.moveTo(x, major ? 14 : 23); g.lineTo(x, 28); g.stroke();
+      if (major) { g.fillStyle = '#8b959e'; g.fillText(k + 1, x + 4, 20); }
     }
   },
 
@@ -277,7 +410,7 @@ const Playlist = {
       },
       U.el('div.h-color'),
       U.el('div.h-main', null,
-        U.el('div.h-row', null, name,
+        U.el('div.h-row', null, t.bus ? U.el('span.bus-tag', { text: 'BUS' }) : null, name,
           btn('m', 'M', 'Mute', t.mute, () => App.edit(() => { t.mute = !t.mute; }, 'heads,mixer')),
           btn('s', 'S', 'Solo', t.solo, () => App.edit(() => { t.solo = !t.solo; }, 'heads,mixer')),
           btn('fx', t.fx.length ? 'FX ' + t.fx.length : 'FX', 'Effects for this track', t.fx.length > 0, () => { App.selectTrack(t.id); App.setTab('mixer'); })),
@@ -286,7 +419,9 @@ const Playlist = {
           UI.slider({ min: -1, max: 1, value: t.pan, def: 0, title: 'Pan', cls: 'sl h-pan', oninput: (v, s) => { t.pan = v; App.mixChanged(t.id, s); } }))),
       meter);
     });
-    rows.push(U.el('button.add-track', { text: '+ Add track', onclick: () => App.addTrack() }));
+    rows.push(U.el('div.add-row', null,
+      U.el('button.add-track', { text: '+ Track', onclick: () => App.addTrack() }),
+      U.el('button.add-track', { text: '+ Bus', title: 'A bus is a shared fader and effect chain that other tracks feed into', onclick: () => App.addBus() })));
     this.heads.replaceChildren(...rows);
   },
 
@@ -296,6 +431,11 @@ const Playlist = {
       { label: 'Rename', onclick: () => { nameInput.focus(); nameInput.select(); } },
       { label: 'Change colour', onclick: () => App.edit(() => { t.color = COLORS[(COLORS.indexOf(t.color) + 1) % COLORS.length]; }, 'heads,timeline,mixer') },
       { label: 'Duplicate track', onclick: () => App.duplicateTrack(t) },
+      { label: 'Clear automation', disabled: !t.auto.vol.length && !t.auto.pan.length, onclick: () => App.edit(() => { t.auto = { vol: [], pan: [] }; }, 'timeline', true) },
+      ...(t.bus ? [] : ['-', ...[null, ...p.tracks.filter(b => b.bus)].map(b => ({
+        label: (((t.out || null) === (b ? b.id : null)) ? '● ' : '○ ') + 'Output → ' + (b ? b.name : 'Master'),
+        onclick: () => App.edit(() => { t.out = b ? b.id : null; }, 'heads,mixer'),
+      }))]),
       '-',
       { label: 'Move up', disabled: i === 0, onclick: () => App.edit(() => { p.tracks.splice(i - 1, 0, p.tracks.splice(i, 1)[0]); }, 'heads,timeline,mixer') },
       { label: 'Move down', disabled: i === p.tracks.length - 1, onclick: () => App.edit(() => { p.tracks.splice(i + 1, 0, p.tracks.splice(i, 1)[0]); }, 'heads,timeline,mixer') },
@@ -333,6 +473,7 @@ const Playlist = {
     if (e.button !== 0) return;
     const [x, y] = this.xy(e), sc = this.sc, p = App.project;
     if (x > sc.clientWidth || y > sc.clientHeight) return;   // scrollbar
+    if (App.tool === 'auto') return this.autoDown(e, x, y);
     const t = this.x2t(x), h = this.hit(x, y);
 
     if (App.tool !== 'select') {
@@ -373,6 +514,12 @@ const Playlist = {
     }
     const t = this.x2t(x), sy = this.sc.scrollTop;
 
+    if (d.kind === 'auto') {
+      d.pt.t = d.tg.tOf(x, e);
+      d.pt.v = Math.round(d.tg.vOf(y) * 100) / 100;
+      d.tg.pts.sort((a, b) => a.t - b.t);
+      return this.draw();
+    }
     if (d.kind === 'band') {
       const b = this.band = { x0: d.x + (d.sx0 = d.sx0 == null ? this.sc.scrollLeft : d.sx0), y0: d.y + (d.sy0 = d.sy0 == null ? sy : d.sy0), x1: x + this.sc.scrollLeft, y1: y + sy };
       const ta = Math.min(b.x0, b.x1) / this.pps, tb = Math.max(b.x0, b.x1) / this.pps;
@@ -382,13 +529,16 @@ const Playlist = {
       return this.draw();
     }
 
-    const c = d.clip, o = d.orig.get(c.id), oDur = o.len / o.rate, buf = Engine.buffers.get(c.sampleId), sDur = buf ? buf.duration : o.offset + o.len;
+    const c = d.clip, o = d.orig.get(c.id), oDur = o.len / o.rate, buf = Engine.buffers.get(c.sampleId), sDur = c.kind === 'pattern' ? Infinity : buf ? buf.duration : o.offset + o.len;
     if (d.kind === 'body') {
       let dt = this.snap(t - d.grabT, e) - o.start, dRow = Math.floor((y + sy) / this.TH) - d.row;
       let minStart = Infinity, minRow = Infinity, maxRow = -Infinity;
       for (const k of d.orig.values()) { minStart = Math.min(minStart, k.start); minRow = Math.min(minRow, k.row); maxRow = Math.max(maxRow, k.row); }
       dt = Math.max(dt, -minStart);
       dRow = U.clamp(dRow, -minRow, p.tracks.length - 1 - maxRow);
+      // clips cannot live on a bus: keep the last valid row
+      if ([...d.orig.values()].some(k => p.tracks[k.row + dRow].bus)) dRow = d.dRow || 0;
+      d.dRow = dRow;
       for (const k of p.clips) {
         const ko = d.orig.get(k.id);
         if (ko) { k.start = ko.start + dt; k.trackId = p.tracks[ko.row + dRow].id; }
@@ -412,6 +562,7 @@ const Playlist = {
     const d = this.drag;
     this.drag = null;
     if (!d) return;
+    if (d.kind === 'auto') { Engine.syncMix(); App.clipsChanged(); return this.draw(); }
     if (d.kind === 'band') {
       this.band = null;
       if (!d.moved) {
@@ -434,6 +585,7 @@ const Playlist = {
   hover(x, y, e) {
     const h = this.hit(x, y), tool = App.tool;
     let cur = 'default', sliceX = null;
+    if (tool === 'auto') { const tg = this.autoTarget(x, y); this.sc.style.cursor = tg ? (this.autoHit(tg, x, y) ? 'move' : 'crosshair') : 'default'; return; }
     if (h && tool === 'select') cur = h.zone === 'body' ? 'grab' : h.zone === 'l' || h.zone === 'r' ? 'ew-resize' : 'col-resize';
     else if (h && tool === 'slice') { cur = 'crosshair'; sliceX = Math.round(this.snap(this.x2t(x), e) * this.pps - this.sc.scrollLeft); }
     else if (h) cur = 'pointer';
@@ -443,6 +595,14 @@ const Playlist = {
 
   onMenu(e) {
     e.preventDefault();
+    if (App.tool === 'auto') {
+      const [ax, ay] = this.xy(e), tg = this.autoTarget(ax, ay), pt = tg && this.autoHit(tg, ax, ay);
+      if (!pt) return;
+      App.pushUndo();
+      tg.pts.splice(tg.pts.indexOf(pt), 1);
+      Engine.syncMix(); App.clipsChanged();
+      return this.draw();
+    }
     const h = this.hit(...this.xy(e));
     if (!h) return;
     if (!App.sel.has(h.clip.id)) { App.sel = new Set([h.clip.id]); App.refresh('timeline,clip'); }
@@ -450,6 +610,7 @@ const Playlist = {
     UI.menu(e.clientX, e.clientY, [
       { label: 'Split at playhead', onclick: () => App.splitAtPlayhead() },
       { label: 'Duplicate' + s, onclick: () => App.duplicateSelected() },
+      { label: 'Crossfade overlaps', onclick: () => App.crossfade() },
       { label: 'Copy' + s, onclick: () => App.copy() },
       '-',
       { label: 'Reverse' + s, onclick: () => App.eachSelected(c => App.reverseClip(c)) },

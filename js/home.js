@@ -7,6 +7,18 @@ const Home = {
   init() {
     $('#home-new').onclick = () => this.create();
     $('#home-search').oninput = () => this.render();
+    $('#home-import').onclick = () => $('#proj-input').click();
+    $('#proj-input').onchange = async e => {
+      const files = [...e.target.files];
+      e.target.value = '';
+      for (const f of files) {
+        UI.busy('Importing “' + f.name + '”…');
+        try { const p = await ProjectFile.importProject(f); UI.toast('Imported “' + p.name + '”'); }
+        catch (err) { UI.toast('Could not import “' + f.name + '”: ' + err.message, 'error'); }
+      }
+      UI.busy(false);
+      this.show();
+    };
   },
 
   async show() {
@@ -33,7 +45,7 @@ const Home = {
     if (!this.projects.length) {
       return grid.replaceChildren(U.el('div.home-empty', null,
         U.el('h2', { text: 'No projects yet' }),
-        U.el('p', { text: 'Create a project, drop in your WAV files, then cut, arrange, add effects and export. Everything is saved in this browser automatically.' }),
+        U.el('p', { text: 'Create a project, drop in your WAV files, then cut, arrange, add effects and export. Everything is saved automatically, and you can save a .tapehead project file as a backup or to move a project to another computer.' }),
         U.el('button.btn.accent', { text: 'Create your first project', onclick: () => this.create() })));
     }
     grid.replaceChildren(
@@ -43,6 +55,7 @@ const Home = {
   },
 
   card(p) {
+    App.migrate(p);
     const end = Engine.songEnd(p), thumb = U.el('canvas.card-thumb', { width: 520, height: 132 });
     this.thumb(thumb, p, end);
     const menu = e => {
@@ -51,6 +64,7 @@ const Home = {
         { label: 'Open', onclick: () => App.open(p.id) },
         { label: 'Rename', onclick: () => this.rename(p) },
         { label: 'Duplicate', onclick: () => this.duplicate(p) },
+        { label: 'Save project file (.tapehead)…', onclick: () => ProjectFile.exportProject(p) },
         '-',
         { label: 'Delete', danger: true, onclick: () => this.remove(p) },
       ]);

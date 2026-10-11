@@ -11,6 +11,7 @@ const App = {
   fxOwner: 'master',    // strip whose effect chain is shown
   tool: 'select',
   tab: 'rack',
+  autoParam: 'vol',     // what the Automate tool edits: 'vol' | 'pan' | 'clip'
   clipboard: null,
 
   async init() {
@@ -30,7 +31,7 @@ const App = {
   /* ---------- project lifecycle ---------- */
 
   newTrack(p, name) {
-    return { id: U.uid('t'), name: name || 'Track ' + (p.tracks.length + 1), color: COLORS[p.tracks.length % COLORS.length], vol: 0.8, pan: 0, mute: false, solo: false, fx: [] };
+    return { id: U.uid('t'), name: name || 'Track ' + (p.tracks.length + 1), color: COLORS[p.tracks.length % COLORS.length], vol: 0.8, pan: 0, mute: false, solo: false, fx: [], bus: false, out: null, send: { to: null, amt: 0.5 }, auto: { vol: [], pan: [] } };
   },
 
   newProject(name) {
@@ -41,7 +42,7 @@ const App = {
       loop: { on: false, start: 0, end: 0 },
       view: { pps: 60, snap: 1 },
       master: { vol: 0.9, fx: [] },
-      tracks: [], clips: [], samples: [],
+      v: 2, tracks: [], clips: [], samples: [], markers: [],
       patterns: [pat], curPat: pat.id,
     };
     for (let i = 0; i < 4; i++) p.tracks.push(this.newTrack(p));
@@ -51,9 +52,11 @@ const App = {
   async open(id) {
     const p = await DB.get(id);
     if (!p) return UI.toast('Project not found', 'error');
+    this.migrate(p);
     UI.busy('Loading project…');
     try {
       Engine.ensure();
+      await Engine.ready;
       for (const s of p.samples) {
         delete s.missing;
         if (Engine.buffers.has(s.id)) continue;
@@ -78,6 +81,7 @@ const App = {
       this.setTab(this.tab);
       this.setSaveState('Saved');
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+      Extras.firstRun();
     } finally {
       UI.busy(false);
     }
@@ -103,6 +107,8 @@ const App = {
     if (!p) return;
     p.modified = Date.now();
     this.dirty = false;
+    const used = new Set(p.clips.map(c => c.sampleId));
+    p.samples = p.samples.filter(s => !s.hidden || used.has(s.id));
     try {
       await DB.put(p);
       if (!this.dirty) this.setSaveState('Saved');
@@ -183,7 +189,9 @@ const App = {
   /* ---------- top bar ---------- */
 
   bindTop() {
-    $('#btn-home').onclick = () => this.close();
+    $('#btn-home').onclick = e => this.mainMenu(e);
+    $('#btn-rec').onclick = () => this.toggleRecord();
+    $('#auto-param').onchange = e => { this.autoParam = e.target.value; Playlist.draw(); };
     $('#proj-name').onchange = e => {
       const p = this.project;
       p.name = e.target.value.trim() || p.name;
@@ -210,7 +218,12 @@ const App = {
       const v = U.clamp(Math.round(+e.target.value) || this.project.bpm, 40, 300);
       e.target.value = v;
       if (v === this.project.bpm) return;
-      this.edit(() => { this.project.bpm = v; }, 'timeline');
+      this.edit(() => {
+        // live pattern clips are measured in steps, so they keep their musical length
+        const k = this.project.bpm / v;
+        for (const c of this.project.clips) if (c.kind === 'pattern') { c.len *= k; c.offset *= k; }
+        this.project.bpm = v;
+      }, 'timeline,clip');
       Engine.rebuildAllFx();
       Engine.resync();
     };
@@ -247,6 +260,8 @@ const App = {
     $('#btn-metro').classList.toggle('on', p.metro);
     for (const b of $('#mode-seg').children) b.classList.toggle('on', b.dataset.mode === p.mode);
     for (const b of $('#tool-seg').children) b.classList.toggle('on', b.dataset.tool === this.tool);
+    $('#auto-param').hidden = this.tool !== 'auto';
+    $('#auto-param').value = this.autoParam;
     this.syncUndo();
   },
 
@@ -316,7 +331,7 @@ const App = {
       n.id = U.uid('t'); n.name = t.name + ' copy';
       n.fx.forEach(f => { f.id = U.uid('f'); });
       p.tracks.splice(p.tracks.indexOf(t) + 1, 0, n);
-      for (const c of p.clips.filter(c => c.trackId === t.id)) p.clips.push({ ...c, id: U.uid('c'), trackId: n.id });
+      for (const c of p.clips.filter(c => c.trackId === t.id)) p.clips.push({ ...JSON.parse(JSON.stringify(c)), id: U.uid('c'), trackId: n.id });
     }, 'heads,timeline,mixer', true);
   },
 
@@ -325,6 +340,7 @@ const App = {
     this.edit(() => {
       p.tracks = p.tracks.filter(t => t.id !== id);
       p.clips = p.clips.filter(c => c.trackId !== id);
+      for (const t of p.tracks) { if (t.out === id) t.out = null; if (t.send.to === id) t.send.to = null; }
       const ids = new Set(p.clips.map(c => c.id));
       this.sel = new Set([...this.sel].filter(x => ids.has(x)));
       if (this.selTrack === id) this.selTrack = p.tracks.length ? p.tracks[0].id : null;
@@ -354,7 +370,7 @@ const App = {
         const bytes = await f.arrayBuffer(), buf = await Engine.decode(bytes), id = U.uid('s');
         await DB.putAudio(id, { bytes, name: f.name });
         Engine.buffers.set(id, buf);
-        added.push({ id, name: f.name.replace(/\.[^.]+$/, ''), dur: buf.duration, ch: buf.numberOfChannels, sr: buf.sampleRate });
+        added.push({ id, name: f.name.replace(/\.[^.]+$/, ''), dur: buf.duration, ch: buf.numberOfChannels, sr: buf.sampleRate, bpm: Stretch.detectBpm(buf) });
       } catch (e) {
         UI.toast('Could not read “' + f.name + '” — is it an audio file?', 'error');
       }
@@ -365,11 +381,11 @@ const App = {
   },
 
   async removeSample(s) {
-    const p = this.project, used = p.clips.filter(c => c.sampleId === s.id).length;
+    const p = this.project, uses = c => c.sampleId === s.id || c.orig === s.id, used = p.clips.filter(uses).length;
     if (used && !await UI.confirm('Remove sample', '“' + s.name + '” is used by ' + used + ' clip' + (used > 1 ? 's' : '') + ' in the playlist. Remove it and those clips?', 'Remove', true)) return;
     this.edit(() => {
       p.samples = p.samples.filter(x => x.id !== s.id);
-      p.clips = p.clips.filter(c => c.sampleId !== s.id);
+      p.clips = p.clips.filter(c => !uses(c));
       for (const pat of p.patterns) pat.channels = pat.channels.filter(ch => ch.sampleId !== s.id);
       const ids = new Set(p.clips.map(c => c.id));
       this.sel = new Set([...this.sel].filter(x => ids.has(x)));
@@ -378,7 +394,7 @@ const App = {
 
   makeClip(sampleId, trackId, start) {
     const buf = Engine.buffers.get(sampleId), meta = this.sampleMeta(sampleId);
-    return { id: U.uid('c'), trackId, sampleId, name: meta ? meta.name : 'Clip', start, offset: 0, len: buf.duration, rate: 1, gain: 1, fadeIn: 0, fadeOut: 0, reverse: false, mute: false };
+    return { id: U.uid('c'), kind: 'audio', trackId, sampleId, name: meta ? meta.name : 'Clip', start, offset: 0, len: buf.duration, rate: 1, gain: 1, fadeIn: 0, fadeOut: 0, reverse: false, mute: false, env: [] };
   },
 
   // Place samples at time t, one per track starting at the given row (tracks are created as needed).
@@ -390,7 +406,7 @@ const App = {
       row = U.clamp(row, 0, p.tracks.length);
       ids.forEach((id, i) => {
         let tr = p.tracks[row + i];
-        if (!tr) { tr = this.newTrack(p); p.tracks.push(tr); }
+        if (!tr || tr.bus) { tr = this.newTrack(p); p.tracks.push(tr); }
         const c = this.makeClip(id, tr.id, Math.max(0, t));
         p.clips.push(c);
         this.sel.add(c.id);
@@ -429,8 +445,10 @@ const App = {
     this.edit(() => {
       for (const c of hits) {
         const cut = (t - c.start) * c.rate;
-        const right = { ...c, id: U.uid('c'), start: t, offset: c.offset + cut, len: c.len - cut, fadeIn: 0 };
+        const at = t - c.start;
+        const right = { ...c, id: U.uid('c'), start: t, offset: c.offset + cut, len: c.len - cut, fadeIn: 0, env: c.env.filter(pt => pt.t >= at).map(pt => ({ t: pt.t - at, v: pt.v })) };
         c.len = cut; c.fadeOut = 0;
+        c.env = c.env.filter(pt => pt.t < at);
         this.clampFades(c); this.clampFades(right);
         p.clips.push(right);
         if (this.sel.has(c.id)) this.sel.add(right.id);
@@ -455,7 +473,7 @@ const App = {
     const a = Math.min(...src.map(c => c.start)), b = Math.max(...src.map(c => c.start + c.len / c.rate));
     this.edit(() => {
       this.sel.clear();
-      for (const c of src) { const n = { ...c, id: U.uid('c'), start: c.start + (b - a) }; p.clips.push(n); this.sel.add(n.id); }
+      for (const c of src) { const n = { ...JSON.parse(JSON.stringify(c)), id: U.uid('c'), start: c.start + (b - a) }; p.clips.push(n); this.sel.add(n.id); }
     }, 'timeline,clip', true);
   },
 
@@ -471,9 +489,9 @@ const App = {
     this.edit(() => {
       this.sel.clear();
       for (const c of cb) {
-        if (!Engine.buffers.has(c.sampleId)) continue;
-        const trackId = p.tracks.some(t => t.id === c.trackId) ? c.trackId : (this.selTrack || p.tracks[0].id);
-        const n = { ...c, id: U.uid('c'), trackId, start: at + c.start - a };
+        if (c.kind === 'pattern' ? !p.patterns.some(x => x.id === c.patId) : !Engine.buffers.has(c.sampleId)) continue;
+        const trackId = p.tracks.some(t => t.id === c.trackId && !t.bus) ? c.trackId : (this.selTrack || p.tracks[0].id);
+        const n = { ...JSON.parse(JSON.stringify(c)), id: U.uid('c'), trackId, start: at + c.start - a };
         p.clips.push(n);
         this.sel.add(n.id);
       }
@@ -494,7 +512,7 @@ const App = {
     let at;
     this.edit(() => {
       p.samples.push({ id, name, dur: buf.duration, ch: 2, sr: buf.sampleRate });
-      let tr = p.tracks.find(t => t.name === 'Beats');
+      let tr = p.tracks.find(t => t.name === 'Beats' && !t.bus);
       if (!tr) { tr = this.newTrack(p, 'Beats'); p.tracks.push(tr); }
       // drop it at the playhead's bar, or after the last beat clip if that spot is taken
       const mine = p.clips.filter(c => c.trackId === tr.id);
@@ -508,7 +526,7 @@ const App = {
       this.sel = new Set([c.id]);
       this.selTrack = tr.id;
     }, null, true);
-    UI.toast('“' + name + '” added to the Beats track at bar ' + (Math.round(at / bar) + 1) + ' — switch to SONG to hear it in the mix');
+    UI.toast('“' + name + '” rendered to the Beats track at bar ' + (Math.round(at / bar) + 1));
   },
 
   /* ---------- export ---------- */
@@ -522,16 +540,21 @@ const App = {
       range: U.el('select.field', null, U.el('option', { value: 'song', text: 'Whole song (' + U.fmtTime(end) + ')' }),
         hasLoop ? U.el('option', { value: 'loop', text: 'Loop region (' + U.fmtTime(p.loop.end - p.loop.start) + ')' }) : null),
       sr: U.el('select.field', null, [44100, 48000, 96000].map(r => U.el('option', { value: r, text: r / 1000 + ' kHz', selected: r === 44100 }))),
+      fmt: U.el('select.field', null, U.el('option', { value: 'wav', text: 'WAV (lossless)' }), U.el('option', { value: 'mp3', text: 'MP3' })),
       bits: U.el('select.field', null, U.el('option', { value: 16, text: '16-bit PCM' }), U.el('option', { value: 24, text: '24-bit PCM', selected: true }), U.el('option', { value: 32, text: '32-bit float' })),
+      kbps: U.el('select.field', null, [128, 192, 256, 320].map(k => U.el('option', { value: k, text: k + ' kbps', selected: k === 256 }))),
       tail: U.el('input.field', { type: 'number', min: 0, max: 30, step: 0.5, value: 2 }),
       norm: U.el('input', { type: 'checkbox' }),
     };
     const row = (label, ctl) => U.el('label.form-row', null, U.el('span', { text: label }), ctl);
     const status = U.el('div.dim.form-status');
+    const bitsRow = row('Bit depth', f.bits), kbpsRow = row('MP3 quality', f.kbps);
+    kbpsRow.hidden = true;
+    f.fmt.onchange = () => { const mp3 = f.fmt.value === 'mp3'; bitsRow.hidden = mp3; kbpsRow.hidden = !mp3; };
     UI.modal({
-      title: 'Export WAV',
+      title: 'Export audio',
       body: U.el('div.form', null,
-        row('File name', f.name), row('Range', f.range), row('Sample rate', f.sr), row('Bit depth', f.bits),
+        row('File name', f.name), row('Format', f.fmt), row('Range', f.range), row('Sample rate', f.sr), bitsRow, kbpsRow,
         row('Effect tail (seconds)', f.tail), row('Normalize peak to −0.3 dB', f.norm), status),
       actions: [
         { label: 'Cancel' },
@@ -540,7 +563,7 @@ const App = {
             btn.disabled = true;
             status.textContent = 'Rendering…';
             try {
-              const loop = f.range.value === 'loop', bits = +f.bits.value, sampleRate = +f.sr.value;
+              const mp3 = f.fmt.value === 'mp3', loop = f.range.value === 'loop', bits = mp3 ? 16 : +f.bits.value, sampleRate = mp3 ? Math.min(48000, +f.sr.value) : +f.sr.value;
               const buf = await Engine.renderSong(p, {
                 sampleRate, from: loop ? p.loop.start : 0, to: loop ? p.loop.end : end,
                 tail: U.clamp(+f.tail.value || 0, 0, 30),
@@ -552,8 +575,9 @@ const App = {
                 const k = U.dbToGain(-0.3) / peak;
                 for (const d of ch) for (let i = 0; i < d.length; i++) d[i] *= k;
               }
-              const file = (f.name.value.trim() || 'export').replace(/[\\/:*?"<>|]/g, '_') + '.wav';
-              U.download(new Blob([U.encodeWav(ch, sampleRate, bits)], { type: 'audio/wav' }), file);
+              const file = (f.name.value.trim() || 'export').replace(/[\\/:*?"<>|]/g, '_') + (mp3 ? '.mp3' : '.wav');
+              if (mp3) { status.textContent = 'Encoding MP3…'; U.download(await ProjectFile.mp3(ch, sampleRate, +f.kbps.value), file); }
+              else U.download(new Blob([U.encodeWav(ch, sampleRate, bits)], { type: 'audio/wav' }), file);
               close();
               if (!f.norm.checked && bits !== 32 && peak > 1) UI.toast('Exported, but the mix peaks ' + U.gainToDb(peak).toFixed(1) + ' dB over full scale and was clipped. Lower the master or enable Normalize.', 'error');
               else UI.toast('Exported ' + file);
@@ -589,6 +613,11 @@ const App = {
       else if (mod) ok = false;
       else if (k === 'delete' || k === 'backspace') this.deleteSelected();
       else if (k === 's') this.splitAtPlayhead();
+      else if (k === '?' || (k === '/' && e.shiftKey)) Extras.shortcuts();
+      else if (k === 'a') this.setTool('auto');
+      else if (k === 'm') this.addMarker(Engine.position());
+      else if (k === 'x') this.crossfade();
+      else if (k === 'r') this.toggleRecord();
       else if (k === 'v') this.setTool('select');
       else if (k === 'c') this.setTool('slice');
       else if (k === 't') this.setTool('mute');
@@ -624,6 +653,7 @@ const App = {
       b.classList.toggle('on', Engine.playing);
     }
     Rack.highlight(Engine.playing && Engine.mode === 'pat' ? Engine.currentStep() : -1);
+    if (this.tab === 'mixer') Panels.drawSpectrum();
 
     this.meter($('#master-meter').getContext('2d'), Engine.level(Engine.graph.master), true);
     for (const [id, strip] of Engine.graph.tracks) {
@@ -646,4 +676,3 @@ const App = {
   },
 };
 
-App.init();

@@ -28,11 +28,15 @@ function createWindow() {
       try {
         const out = await win.webContents.executeJavaScript(`(async () => {
           const p = App.newProject('smoke'); await DB.put(p); await App.open(p.id);
+          document.querySelector('#overlay').replaceChildren();
           App.addClips(['kit:kick', 'kit:808'], 0, 0);
+          App.addPatternClip(1);
+          App.fxEdit('master', () => { const f = FX.make('limiter'); f.p.gain = 18; App.project.master.fx.push(f); });
           const buf = await Engine.renderSong(App.project, { sampleRate: 44100, from: 0, to: Engine.songEnd(App.project), tail: 0.5 });
           let peak = 0; for (const v of buf.getChannelData(0)) peak = Math.max(peak, Math.abs(v));
           const saved = (await DB.get(p.id)).name; await DB.del(p.id);
-          return JSON.stringify({ origin: location.protocol, clips: App.project.clips.length, seconds: +buf.duration.toFixed(2), peak: +peak.toFixed(3), saved });
+          localStorage.removeItem('tapehead.tour');
+          return JSON.stringify({ origin: location.protocol, worklets: Engine.ctx._tp, mp3: typeof lamejs, clips: App.project.clips.length, seconds: +buf.duration.toFixed(2), peak: +peak.toFixed(3), saved });
         })()`);
         console.log('SMOKE OK ' + out);
         app.exit(0);

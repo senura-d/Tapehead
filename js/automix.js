@@ -26,6 +26,7 @@ const AutoMix = {
         U.el('option', { value: -10, text: 'Loud (−10 LUFS)' }),
         U.el('option', { value: -16, text: 'Dynamic (−16 LUFS)' })),
       levels: check(true), pan: check(true), trackFx: check(true), master: check(true),
+      ref: U.el('input.field', { type: 'file', accept: 'audio/*,.wav,.mp3,.flac,.ogg,.m4a', title: 'Optional: a finished song whose loudness and tone you want to match' }),
     };
     const row = (label, ctl) => U.el('label.form-row', null, U.el('span', { text: label }), ctl);
     UI.modal({
@@ -34,14 +35,21 @@ const AutoMix = {
         U.el('p', { text: 'Analyses every track, then sets levels, panning and effects for you. Your own effects are kept. The whole thing is one undo step.' }),
         row('Balance track levels', f.levels), row('Pan tracks across the stereo field', f.pan),
         row('Add EQ and compression per track', f.trackFx), row('Master: EQ, glue compressor, limiter', f.master),
-        row('Loudness target', f.target)),
+        row('Loudness target', f.target),
+        row('…or match a reference song', f.ref)),
       actions: [
         { label: 'Cancel' },
         {
           label: 'Analyse & apply', kind: 'accent', onclick: async close => {
             close();
             try {
-              const rep = await this.run({ target: +f.target.value, levels: f.levels.checked, pan: f.pan.checked, trackFx: f.trackFx.checked, master: f.master.checked });
+              let ref = null;
+              if (f.ref.files[0]) {
+                UI.busy('Analysing the reference song…');
+                const buf = await Engine.decode(await f.ref.files[0].arrayBuffer());
+                ref = { name: f.ref.files[0].name, lufs: (await this.lufs(buf)).lufs, tone: this.stats(buf) };
+              }
+              const rep = await this.run({ target: ref ? Math.round(ref.lufs * 10) / 10 : +f.target.value, ref, levels: f.levels.checked, pan: f.pan.checked, trackFx: f.trackFx.checked, master: f.master.checked });
               this.report(rep);
             } catch (e) {
               console.error(e);
@@ -180,23 +188,26 @@ const AutoMix = {
       w.master.vol = 1;
       const pre = this.stats(await mixdown());
       const trim = this.fx('utility', { gain: 0 });
+      // with a reference, tilt the master EQ towards its balance of lows and highs (within +/-4 dB)
+      const tilt = k => (o.ref && o.ref.tone ? U.clamp(10 * Math.log10(o.ref.tone[k] / Math.max(1e-6, pre[k])), -4, 4) : null);
+      const low = tilt('low'), high = tilt('high');
       w.master.fx.push(
-        this.fx('eq', { hp: 25, low: 0.5, mid: 0, high: 1 }),
+        this.fx('eq', { hp: 25, low: low == null ? 0.5 : Math.round(low * 2) / 2, mid: 0, high: high == null ? 1 : Math.round(high * 2) / 2 }),
         this.fx('comp', { thr: U.clamp(Math.round(pre.rmsDb + 4), -40, -6), ratio: 2, att: 30, rel: 250, knee: 12, makeup: 0 }),
         trim,
-        this.fx('limiter', { gain: 0, ceil: -2, rel: 80 }));
-      // The limiter is not a brick wall, so verify by rendering: push gain towards the loudness
-      // target, and back off whenever the rendered peak crosses the ceiling.
+        this.fx('limiter', { gain: 0, ceil: -1, rel: 80 }));
+      // Verify by rendering: push gain into the limiter until the loudness target is met.
+      // Limiting absorbs part of every push, so overshoot the remaining difference a little.
       let capped = false;
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 8; i++) {
         UI.busy('Mastering — pass ' + (i + 1) + '…');
         after = await this.lufs(await mixdown());
-        if (i === 5) break;
+        if (i === 7) break;
         const over = after.peakDb - this.PEAK_CEIL, diff = o.target - after.lufs;
         let g = trim.p.gain;
         if (over > 0) { g -= over + 0.3; capped = true; }
-        else if (Math.abs(diff) >= 0.4 && !(capped && diff > 0)) g += diff;
-        g = U.clamp(Math.round(g * 2) / 2, -24, 24);
+        else if (Math.abs(diff) >= 0.4 && !(capped && diff > 0)) g += diff > 0 ? diff * 1.4 : diff;
+        g = U.clamp(Math.round(g * 2) / 2, -24, 18);
         if (g === trim.p.gain) break;
         trim.p.gain = g;
       }
@@ -234,7 +245,8 @@ const AutoMix = {
         U.el('div.report-sum', null,
           cell('span', 'Loudness'), cell('b', before.lufs.toFixed(1) + ' → ' + after.lufs.toFixed(1) + ' LUFS'),
           cell('span', 'Peak'), cell('b', db(before.peakDb) + ' → ' + db(after.peakDb))),
-        short ? U.el('p', { text: 'The mix stopped ' + (o.target - after.lufs).toFixed(1) + ' dB short of the target: pushing harder would have clipped. It has a lot of peak energy — more compression on the loudest track would let it go louder.' }) : null,
+        o.ref ? U.el('p', { text: 'Matched to “' + o.ref.name + '” (' + o.ref.lufs.toFixed(1) + ' LUFS).' }) : null,
+        short ? U.el('p', { text: 'The mix stopped ' + (o.target - after.lufs).toFixed(1) + ' dB short of the target: the limiter is already working hard and pushing further would squash it. More compression on the loudest track would let it go louder.' }) : null,
         U.el('p', { text: 'Added effects are marked “auto” in the Mixer tab and can be tweaked or removed. Press Ctrl+Z to revert everything.' })),
       actions: [{ label: 'Undo', onclick: c => { c(); App.undo(); } }, { label: 'Keep', kind: 'accent' }],
     });

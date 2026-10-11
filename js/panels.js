@@ -224,6 +224,7 @@ const Panels = {
       act('Split at playhead', () => App.splitAtPlayhead()),
       act('Duplicate', () => App.duplicateSelected()),
       act('Crossfade overlaps', () => App.crossfade(), '', 'Fade this clip into any clip it overlaps on the same track'),
+      act('Transition…', () => App.transitionDialog(), '', 'Blend this clip into the next clip on its track: crossfade, dip, filter sweep or tape stop'),
       act('Delete', () => App.deleteSelected(), '.danger'),
     ];
     if (!sel.length) {
@@ -248,6 +249,13 @@ const Panels = {
       mk('Fade in', { min: 0, max: Math.max(0.01, dur), step: 0.01, value: c.fadeIn, def: 0 }, v => v.toFixed(2) + ' s', v => { c.fadeIn = Math.min(v, c.len / c.rate - c.fadeOut); }),
       mk('Fade out', { min: 0, max: Math.max(0.01, dur), step: 0.01, value: c.fadeOut, def: 0 }, v => v.toFixed(2) + ' s', v => { c.fadeOut = Math.min(v, c.len / c.rate - c.fadeIn); }),
     ];
+    const styleSel = (key, title) => {
+      const s = U.el('select.field.small', { title, onchange: e => App.eachSelected(k => { k[key] = e.target.value; }) },
+        [['linear', 'Linear'], ['smooth', 'Smooth'], ['exp', 'Slow start'], ['filter', 'Filter sweep'], ...(isPat ? [] : [['tape', 'Tape']])].map(([v, t]) => U.el('option', { value: v, text: t })));
+      s.value = c[key] || 'linear';
+      return s;
+    };
+    const styles = U.el('div.fx-param', null, U.el('span.lbl', { text: 'Fade in / out style' }), styleSel('inType', 'How the fade in behaves'), styleSel('outType', 'How the fade out behaves'));
     const envBtn = c.env.length ? act('Clear gain curve', () => App.eachSelected(k => { k.env = []; })) : null;
 
     if (isPat) {
@@ -260,7 +268,7 @@ const Panels = {
           U.el('div.clip-toggles', null,
             act('Edit pattern', () => { if (pat) { p.curPat = pat.id; App.setTab('rack'); Rack.render(); } }),
             U.el('button.btn.small' + (c.mute ? '.on' : ''), { text: 'Mute', onclick: () => App.eachSelected(k => { k.mute = !k.mute; }) }))),
-        U.el('div.clip-sliders', null, gain, fades),
+        U.el('div.clip-sliders', null, gain, fades, styles),
         U.el('div.clip-actions', null, common, envBtn)));
     }
 
@@ -290,7 +298,7 @@ const Panels = {
         gain,
         mk('Speed (pitch follows)', { min: -12, max: 12, step: 1, value: st, def: 0, rerender: true },
           v => (v > 0 ? '+' : '') + v + ' st', v => { c.rate = Math.pow(2, v / 12); }),
-        fades),
+        fades, styles),
       U.el('div.clip-sliders', null,
         lazy('Length, keep pitch', { min: 50, max: 200, step: 1, value: Math.round(ts * 100), def: 100 }, v => Math.round(v) + '%', v => App.retime(c, v / 100, ps)),
         lazy('Pitch, keep length', { min: -12, max: 12, step: 1, value: ps, def: 0 }, v => (v > 0 ? '+' : '') + v + ' st', v => App.retime(c, ts, v)),

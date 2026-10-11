@@ -1,6 +1,6 @@
 {
   "name": "tapehead",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Multitrack audio studio: edit WAV files, make beats, add effects, auto mix & master, export WAV.",
   "author": "senura-d",
   "private": true,

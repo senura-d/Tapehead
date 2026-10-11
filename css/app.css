@@ -369,3 +369,6 @@ kbd { font: 11px var(--mono); background: #0b0d0e; border: 1px solid var(--line-
 .modal:has(.keys) .modal-body { max-height: 62vh; overflow: auto; }
 input[type=file].field { height: auto; padding: 4px; font-size: 11px; }
 @media (max-width: 1500px) { .master > span { display: none; } .master { grid-template-columns: 54px; } #tool-seg button { padding: 0 6px; } }
+
+#auto-param { max-width: 132px; }
+.clip-sliders .fx-param select { flex: 1; min-width: 0; }

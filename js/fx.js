@@ -5,7 +5,8 @@
 const FX = (() => {
   const isLive = ctx => typeof AudioContext !== 'undefined' && ctx instanceof AudioContext;
   const setP = (ctx, param, v) => {
-    if (isLive(ctx)) param.setTargetAtTime(v, ctx.currentTime, 0.012);
+    // (an offline render only changes parameters mid-way when automation is being applied)
+    if (isLive(ctx) || ctx.currentTime > 0) param.setTargetAtTime(v, ctx.currentTime, 0.012);
     else param.value = v;
   };
 
@@ -132,7 +133,7 @@ const FX = (() => {
     reverb: {
       name: 'Reverb',
       params: [
-        { k: 'decay', label: 'Decay', min: 0.2, max: 8, def: 2.2, unit: 's', step: 0.1 },
+        { k: 'decay', label: 'Decay', min: 0.2, max: 8, def: 2.2, unit: 's', step: 0.1, noAuto: true },
         { k: 'pre', label: 'Pre-delay', min: 0, max: 100, def: 10, unit: 'ms', step: 1 },
         { k: 'tone', label: 'Tone', min: 500, max: 16000, def: 6000, unit: 'Hz', log: true },
         { k: 'mix', label: 'Mix', min: 0, max: 1, def: 0.25, unit: '%' },

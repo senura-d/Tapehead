@@ -77,7 +77,7 @@ const Playlist = {
     sc.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
     sc.addEventListener('drop', async e => {
       e.preventDefault();
-      const [x, y] = this.xy(e), t = this.snap(Math.max(0, this.x2t(x)), e), row = Math.floor((y + sc.scrollTop) / this.TH);
+      const [x, y] = this.xy(e), raw = Math.max(0, this.x2t(x)), t = this.magnet(raw, e) ?? this.snap(raw, e), row = Math.floor((y + sc.scrollTop) / this.TH);
       const id = e.dataTransfer.getData('text/x-sample');
       if (id) return App.addClips([id], row, t);
       if (e.dataTransfer.files.length) {
@@ -97,6 +97,33 @@ const Playlist = {
     if (!s || (e && e.altKey)) return t;
     const g = 60 / p.bpm * s;
     return Math.round(t / g) * g;
+  },
+
+  // Magnet: the nearest clip edge, marker, loop point or playhead within a few pixels of t (or null).
+  magnet(t, e, skip) {
+    const p = App.project;
+    if (!p.view.magnet || (e && e.altKey)) return null;
+    let best = null, bd = 9 / this.pps;
+    const test = x => { const d = Math.abs(x - t); if (d < bd) { bd = d; best = x; } };
+    test(0);
+    if (!Engine.playing) test(Engine.pos);
+    for (const m of p.markers) test(m.t);
+    if (p.loop.end > p.loop.start) { test(p.loop.start); test(p.loop.end); }
+    for (const c of p.clips) if (!skip || !skip.has(c.id)) { test(c.start); test(c.start + c.len / c.rate); }
+    return best;
+  },
+  // where a dragged edge lands: magnet first, grid otherwise
+  edge(t, e, skip) {
+    const m = this.magnet(t, e, skip);
+    this.guideT = m;
+    return m == null ? this.snap(t, e) : m;
+  },
+
+  // effect settings are drawn on a 0..1 scale (log for frequencies)
+  fxNorm(d) {
+    if (d.log) { const r = Math.log(d.max / d.min); return { to: v => Math.log(v / d.min) / r, from: n => Math.round(d.min * Math.exp(n * r)) }; }
+    const s = d.step || 0.01;
+    return { to: v => (v - d.min) / (d.max - d.min), from: n => Math.round((d.min + n * (d.max - d.min)) / s) * s };
   },
 
   zoom(f, anchorX) {
@@ -179,6 +206,19 @@ const Playlist = {
         this.drawCurve(g, pts, prm === 'vol' ? 1 : t.pan, v => this.autoY(prm, v, i * TH - sy), tt => tt * pps - sx, 0, W, active, prm === 'vol' ? '#6fdc8c' : '#4fc3f7');
       }
     });
+    p.tracks.forEach((t, i) => {
+      for (const fx of t.fx) {
+        const def = FX.defs[fx.type], keys = new Set(Object.keys(fx.auto || {}));
+        if (!def) continue;
+        if (autoOn && App.autoParam.startsWith('fx:' + fx.id + ':')) keys.add(App.autoParam.split(':')[2]);
+        for (const k of keys) {
+          const pts = (fx.auto && fx.auto[k]) || [], active = autoOn && App.autoParam === 'fx:' + fx.id + ':' + k, d = def.params.find(q => q.k === k);
+          if (!d || (!pts.length && !active)) continue;
+          const N = this.fxNorm(d), rowY = i * TH - sy;
+          this.drawCurve(g, pts, fx.p[k], v => rowY + TH - 5 - U.clamp(N.to(v), 0, 1) * (TH - 10), tt => tt * pps - sx, 0, W, active, '#ffb37a');
+        }
+      }
+    });
     for (const m of p.markers) {
       g.fillStyle = 'rgba(157,140,255,0.35)';
       g.fillRect(Math.round(m.t * pps - sx), 0, 1, bottom);
@@ -197,6 +237,17 @@ const Playlist = {
       g.fillStyle = 'rgba(255,138,42,0.08)'; g.strokeStyle = 'rgba(255,138,42,0.7)';
       g.fillRect(x, y, Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
       g.strokeRect(x + 0.5, y + 0.5, Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
+    }
+    if (this.guideT != null) {
+      g.fillStyle = '#ff8a2a';
+      g.fillRect(Math.round(this.guideT * pps - sx), 0, 1, bottom);
+    }
+    if (this.drag && this.drag.kind === 'auto' && this.drag.tg.fmt) {
+      const d = this.drag, lx = d.tg.xOf(d.pt.t) + 9, ly = d.tg.yOf(d.pt.v) - 9;
+      g.font = '10.5px "Cascadia Mono", Consolas, monospace';
+      const txt = d.tg.fmt(d.pt.v), tw = g.measureText(txt).width + 8;
+      g.fillStyle = 'rgba(8,10,12,0.9)'; g.fillRect(lx - 4, ly - 9, tw, 15);
+      g.fillStyle = '#fff'; g.textBaseline = 'middle'; g.fillText(txt, lx, ly - 1);
     }
     if (this.sliceX != null) {
       g.fillStyle = '#fff';
@@ -242,8 +293,14 @@ const Playlist = {
 
     // fades: shade the faded-out area
     g.fillStyle = 'rgba(8,10,12,0.55)';
-    if (c.fadeIn > 0) { g.beginPath(); g.moveTo(x, y + T); g.lineTo(x + c.fadeIn * pps, y + T); g.lineTo(x, y + h); g.fill(); }
-    if (c.fadeOut > 0) { g.beginPath(); g.moveTo(x + w, y + T); g.lineTo(x + w - c.fadeOut * pps, y + T); g.lineTo(x + w, y + h); g.fill(); }
+    const fade = (fx, len, dir, type) => {
+      const f = Engine.SHAPE[type] || Engine.SHAPE.linear, px = len * pps;
+      g.beginPath(); g.moveTo(fx, y + T); g.lineTo(fx + dir * px, y + T);
+      for (let k = 1; k >= 0; k -= 0.05) g.lineTo(fx + dir * k * px, y + h - f(Math.max(0, k)) * (h - T));
+      g.lineTo(fx, y + h); g.fill();
+    };
+    if (c.fadeIn > 0) fade(x, c.fadeIn, 1, c.inType);
+    if (c.fadeOut > 0) fade(x + w, c.fadeOut, -1, c.outType);
 
     if (w > 26) {
       g.fillStyle = '#0d0f11';
@@ -316,11 +373,24 @@ const Playlist = {
       if (!h) return null;
       const c = h.clip, cy = rowY + 2, ch = TH - 5, dur = this.dur(c);
       return {
+        fmt: v => Math.round(v * 100) + '%',
         pts: c.env, xOf: t => (c.start + t) * pps - sx, tOf: X => U.clamp((X + sx) / pps - c.start, 0, dur),
         yOf: v => this.clipEnvY(v, cy, ch), vOf: Y => U.clamp((cy + ch - 3 - Y) / (ch - this.TITLE - 6) * 2, 0, 2),
       };
     }
+    if (prm.startsWith('fx:')) {
+      const [, fid, key] = prm.split(':'), fx = tr.fx.find(f => f.id === fid), d = fx && FX.defs[fx.type].params.find(q => q.k === key);
+      if (!d) return null;
+      fx.auto = fx.auto || {};
+      const N = this.fxNorm(d);
+      return {
+        pts: fx.auto[key] = fx.auto[key] || [], xOf: t => t * pps - sx, tOf: (X, e) => Math.max(0, this.snap((X + sx) / pps, e)),
+        yOf: v => rowY + TH - 5 - U.clamp(N.to(v), 0, 1) * (TH - 10), vOf: Y => N.from(U.clamp((rowY + TH - 5 - Y) / (TH - 10), 0, 1)),
+        fmt: v => FX.fmt(d, v),
+      };
+    }
     return {
+      fmt: v => (prm === 'vol' ? Math.round(v * 100) + '%' : Math.abs(v) < 0.01 ? 'Centre' : (v < 0 ? 'L ' : 'R ') + Math.round(Math.abs(v) * 100)),
       pts: tr.auto[prm], xOf: t => t * pps - sx, tOf: (X, e) => Math.max(0, this.snap((X + sx) / pps, e)),
       yOf: v => this.autoY(prm, v, rowY),
       vOf: Y => (prm === 'vol' ? U.clamp((rowY + TH - 5 - Y) / (TH - 10) * 1.25, 0, 1.25) : U.clamp((rowY + TH / 2 - Y) / (TH / 2 - 5), -1, 1)),
@@ -431,7 +501,7 @@ const Playlist = {
       { label: 'Rename', onclick: () => { nameInput.focus(); nameInput.select(); } },
       { label: 'Change colour', onclick: () => App.edit(() => { t.color = COLORS[(COLORS.indexOf(t.color) + 1) % COLORS.length]; }, 'heads,timeline,mixer') },
       { label: 'Duplicate track', onclick: () => App.duplicateTrack(t) },
-      { label: 'Clear automation', disabled: !t.auto.vol.length && !t.auto.pan.length, onclick: () => App.edit(() => { t.auto = { vol: [], pan: [] }; }, 'timeline', true) },
+      { label: 'Clear automation', onclick: () => App.edit(() => { t.auto = { vol: [], pan: [] }; for (const f of t.fx) delete f.auto; }, 'timeline', true) },
       ...(t.bus ? [] : ['-', ...[null, ...p.tracks.filter(b => b.bus)].map(b => ({
         label: (((t.out || null) === (b ? b.id : null)) ? '● ' : '○ ') + 'Output → ' + (b ? b.name : 'Master'),
         onclick: () => App.edit(() => { t.out = b ? b.id : null; }, 'heads,mixer'),
@@ -531,7 +601,11 @@ const Playlist = {
 
     const c = d.clip, o = d.orig.get(c.id), oDur = o.len / o.rate, buf = Engine.buffers.get(c.sampleId), sDur = c.kind === 'pattern' ? Infinity : buf ? buf.duration : o.offset + o.len;
     if (d.kind === 'body') {
-      let dt = this.snap(t - d.grabT, e) - o.start, dRow = Math.floor((y + sy) / this.TH) - d.row;
+      const raw = t - d.grabT, m1 = this.magnet(raw, e, d.orig), m2 = this.magnet(raw + oDur, e, d.orig);
+      const useStart = m1 != null && (m2 == null || Math.abs(m1 - raw) <= Math.abs(m2 - raw - oDur));
+      const ns0 = useStart ? m1 : m2 != null ? m2 - oDur : this.snap(raw, e);
+      this.guideT = useStart ? m1 : m2;
+      let dt = ns0 - o.start, dRow = Math.floor((y + sy) / this.TH) - d.row;
       let minStart = Infinity, minRow = Infinity, maxRow = -Infinity;
       for (const k of d.orig.values()) { minStart = Math.min(minStart, k.start); minRow = Math.min(minRow, k.row); maxRow = Math.max(maxRow, k.row); }
       dt = Math.max(dt, -minStart);
@@ -544,10 +618,10 @@ const Playlist = {
         if (ko) { k.start = ko.start + dt; k.trackId = p.tracks[ko.row + dRow].id; }
       }
     } else if (d.kind === 'l') {
-      const ns = U.clamp(this.snap(t, e), Math.max(0, o.start - o.offset / o.rate), o.start + oDur - 0.01), delta = ns - o.start;
+      const ns = U.clamp(this.edge(t, e, d.orig), Math.max(0, o.start - o.offset / o.rate), o.start + oDur - 0.01), delta = ns - o.start;
       c.start = ns; c.offset = o.offset + delta * o.rate; c.len = o.len - delta * o.rate;
     } else if (d.kind === 'r') {
-      c.len = U.clamp((this.snap(t, e) - o.start) * o.rate, 0.01 * o.rate, sDur - o.offset);
+      c.len = U.clamp((this.edge(t, e, d.orig) - o.start) * o.rate, 0.01 * o.rate, sDur - o.offset);
     } else if (d.kind === 'fi') {
       c.fadeIn = U.clamp(t - c.start, 0, oDur - c.fadeOut);
     } else if (d.kind === 'fo') {
@@ -561,6 +635,7 @@ const Playlist = {
   onUp(e) {
     const d = this.drag;
     this.drag = null;
+    this.guideT = null;
     if (!d) return;
     if (d.kind === 'auto') { Engine.syncMix(); App.clipsChanged(); return this.draw(); }
     if (d.kind === 'band') {
@@ -611,6 +686,8 @@ const Playlist = {
       { label: 'Split at playhead', onclick: () => App.splitAtPlayhead() },
       { label: 'Duplicate' + s, onclick: () => App.duplicateSelected() },
       { label: 'Crossfade overlaps', onclick: () => App.crossfade() },
+      { label: 'Transition to next clip…', onclick: () => App.transitionDialog() },
+      { label: 'Ripple delete (close the gap)', onclick: () => App.rippleDelete() },
       { label: 'Copy' + s, onclick: () => App.copy() },
       '-',
       { label: 'Reverse' + s, onclick: () => App.eachSelected(c => App.reverseClip(c)) },

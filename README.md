@@ -14,7 +14,9 @@ It is plain HTML and JavaScript on the Web Audio API. There is no build step for
 - Change a clip's length without changing its pitch, or its pitch without changing its length
 - Tempo detection on import and one-click "fit to project tempo"
 - Markers on the ruler, loop region, snap to grid, undo / redo
-- Draw volume and pan automation on a track, or a gain curve inside a single clip
+- Draw automation for track volume, pan and any effect setting (a filter sweep, a reverb swell), or a gain curve inside a single clip
+- Transitions between clips: smooth or linear crossfade, dip to silence, filter sweep, tape stop
+- Magnet mode: dragged clips snap to the edges of other clips, markers and the playhead; ripple delete closes gaps
 - Record from a microphone onto a track
 
 **Make beats**
@@ -57,7 +59,7 @@ npm install
 npm start
 ```
 
-Build installers for the current platform with `npm run dist` (output in `dist/`). Pushing a tag such as `v1.1.0` builds all three platforms on GitHub Actions.
+Build installers for the current platform with `npm run dist` (output in `dist/`). Pushing a tag such as `v1.2.0` builds all three platforms on GitHub Actions.
 
 ## Credits
 

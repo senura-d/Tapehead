@@ -40,7 +40,7 @@ const App = {
       id: U.uid('proj'), name, created: Date.now(), modified: Date.now(),
       bpm: 128, swing: 0, metro: false, mode: 'song',
       loop: { on: false, start: 0, end: 0 },
-      view: { pps: 60, snap: 1 },
+      view: { pps: 60, snap: 1, magnet: true },
       master: { vol: 0.9, fx: [] },
       v: 2, tracks: [], clips: [], samples: [], markers: [],
       patterns: [pat], curPat: pat.id,
@@ -228,6 +228,7 @@ const App = {
       Engine.resync();
     };
     $('#snap').onchange = e => { this.project.view.snap = +e.target.value; this.touch(); };
+    $('#btn-magnet').onclick = () => this.toggleMagnet();
     $('#btn-undo').onclick = () => this.undo();
     $('#btn-redo').onclick = () => this.redo();
     $('#btn-export').onclick = () => this.exportDialog();
@@ -261,7 +262,8 @@ const App = {
     for (const b of $('#mode-seg').children) b.classList.toggle('on', b.dataset.mode === p.mode);
     for (const b of $('#tool-seg').children) b.classList.toggle('on', b.dataset.tool === this.tool);
     $('#auto-param').hidden = this.tool !== 'auto';
-    $('#auto-param').value = this.autoParam;
+    $('#btn-magnet').classList.toggle('on', !!p.view.magnet);
+    this.syncAutoParams();
     this.syncUndo();
   },
 
@@ -303,6 +305,7 @@ const App = {
     this.fxOwner = id;
     for (const h of document.querySelectorAll('.head')) h.classList.toggle('sel', h.dataset.id === this.selTrack);
     for (const s of document.querySelectorAll('.strip')) s.classList.toggle('sel', s.dataset.id === id);
+    this.syncAutoParams();
     Playlist.draw();
     Panels.renderChain();
   },
@@ -353,7 +356,7 @@ const App = {
     this.pushUndo();
     fn();
     Engine.rebuildFx(owner);
-    this.refresh('heads,mixer');
+    this.refresh('heads,mixer,timeline,top');
     this.touch();
   },
 
@@ -611,7 +614,8 @@ const App = {
       else if (mod && k === 'a') { this.sel = new Set(this.project.clips.map(c => c.id)); this.refresh('timeline,clip'); }
       else if (mod && k === 's') { this.save.cancel(); this.saveNow().then(() => UI.toast('Project saved')); }
       else if (mod) ok = false;
-      else if (k === 'delete' || k === 'backspace') this.deleteSelected();
+      else if (k === 'delete' || k === 'backspace') e.shiftKey ? this.rippleDelete() : this.deleteSelected();
+      else if (k === 'n') this.toggleMagnet();
       else if (k === 's') this.splitAtPlayhead();
       else if (k === '?' || (k === '/' && e.shiftKey)) Extras.shortcuts();
       else if (k === 'a') this.setTool('auto');

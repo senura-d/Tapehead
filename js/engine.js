@@ -253,6 +253,63 @@ const Engine = {
       s.auto.gain.value = this.interp(t.auto.vol, pos, 1);
       if (t.auto.pan.length) { s.pan.pan.cancelScheduledValues(0); s.pan.pan.value = this.interp(t.auto.pan, pos, t.pan); }
     }
+    this.applyFxAuto(g, p, pos);
+  },
+
+  /* ---------- effect automation ---------- */
+
+  hasFxAuto(p) {
+    const any = list => list.some(f => f.auto && Object.values(f.auto).some(a => a.length));
+    return any(p.master.fx) || p.tracks.some(t => any(t.fx));
+  },
+
+  // Set every automated effect to its values for playlist time `pos`.
+  applyFxAuto(g, p, pos) {
+    for (const s of [g.master, ...g.tracks.values()]) {
+      for (const f of s.fx) {
+        const a = f.fx.auto;
+        let q = null;
+        if (a) for (const k in a) if (a[k].length) { q = q || { ...f.fx.p }; q[k] = this.interp(a[k], pos, f.fx.p[k]); }
+        if (q) { f.inst.set(q); f.autoOn = true; }
+        else if (f.autoOn) { f.inst.set(f.fx.p); f.autoOn = false; }
+      }
+    }
+  },
+
+  /* ---------- fades and transitions ---------- */
+
+  // how the level moves through a fade, 0..1 -> 0..1
+  SHAPE: {
+    linear: x => x,
+    smooth: x => Math.sin(x * Math.PI / 2),   // equal power: two of these crossing keep the loudness steady
+    exp: x => x * x,
+    filter: x => Math.pow(x, 0.35),           // level stays up while the filter does the work
+    tape: x => Math.sqrt(x),
+  },
+
+  fadeCurve(type, a, b, gain) {
+    const f = this.SHAPE[type] || this.SHAPE.linear, n = 48, c = new Float32Array(n);
+    for (let i = 0; i < n; i++) c[i] = gain * f(a + (b - a) * i / (n - 1));
+    return c;
+  },
+
+  // Schedule a clip's fade in / fade out on its gain. `into` = how far into the clip playback starts.
+  fadeGain(P, gain, inT, outT, fi, fo, dur, into, when) {
+    const fs = dur - fo, rem = dur - into;
+    try {
+      if (fi > 0 && into < fi) P.setValueCurveAtTime(this.fadeCurve(inT, into / fi, 1, gain), when, Math.max(0.001, fi - into - 0.0005));
+      else if (!(fo > 0 && into > fs)) P.setValueAtTime(gain, when);
+      if (fo > 0) {
+        if (into <= fs) P.setValueCurveAtTime(this.fadeCurve(outT, 1, 0, gain), when + fs - into + (into === fs ? 0.0006 : 0), Math.max(0.001, fo - 0.001));
+        else P.setValueCurveAtTime(this.fadeCurve(outT, (dur - into) / fo, 0, gain), when, Math.max(0.001, rem));
+      }
+    } catch (e) {
+      // curves may not overlap; fall back to plain ramps rather than lose the clip
+      P.cancelScheduledValues(0);
+      P.setValueAtTime(gain * Math.min(1, fi > 0 ? into / fi : 1, fo > 0 ? rem / fo : 1), when);
+      if (fi > 0 && into < fi) P.linearRampToValueAtTime(gain, when + fi - into);
+      if (fo > 0) { if (into < fs) P.setValueAtTime(gain, when + fs - into); P.linearRampToValueAtTime(0, when + rem); }
+    }
   },
 
   /* ---------- scheduling ---------- */
@@ -296,22 +353,31 @@ const Engine = {
       if (end <= from + 1e-4 || (to != null && c.start >= to)) continue;
       const into = Math.max(0, from - c.start), when = t0 + Math.max(0, c.start - from), rem = dur - into;
 
-      // fades
+      // fades / transitions
       const gn = ctx.createGain();
-      const fi = Math.min(c.fadeIn || 0, dur), fo = Math.min(c.fadeOut || 0, dur - fi);
-      const env = t => c.gain * Math.min(1, fi > 0 ? t / fi : 1, fo > 0 ? (dur - t) / fo : 1);
-      gn.gain.setValueAtTime(env(into), when);
-      if (fi > 0 && into < fi) gn.gain.linearRampToValueAtTime(env(fi), when + fi - into);
-      if (fo > 0) {
-        const fs = dur - fo;
-        if (into < fs) gn.gain.setValueAtTime(env(fs), when + fs - into);
-        gn.gain.linearRampToValueAtTime(0, when + rem);
+      const fi = Math.min(c.fadeIn || 0, dur), fo = Math.min(c.fadeOut || 0, dur - fi), fs = dur - fo;
+      const inT = c.inType || 'linear', outT = c.outType || 'linear';
+      this.fadeGain(gn.gain, c.gain, inT, outT, fi, fo, dur, into, when);
+      let out = gn;
+      // "filter sweep" transitions: a low-pass that opens on the way in and closes on the way out
+      if ((inT === 'filter' && fi > 0) || (outT === 'filter' && fo > 0)) {
+        const lp = ctx.createBiquadFilter(), F = lp.frequency, LO = 160, HI = 18000;
+        lp.type = 'lowpass'; lp.Q.value = 0.8;
+        if (inT === 'filter' && fi > 0 && into < fi) { F.setValueAtTime(LO * Math.pow(HI / LO, into / fi), when); F.exponentialRampToValueAtTime(HI, when + fi - into); }
+        else F.setValueAtTime(HI, when);
+        if (outT === 'filter' && fo > 0) {
+          if (into < fs) F.setValueAtTime(HI, when + fs - into);
+          else F.setValueAtTime(HI * Math.pow(LO / HI, (into - fs) / fo), when);
+          F.exponentialRampToValueAtTime(LO, when + rem);
+        }
+        gn.connect(lp);
+        out = lp;
       }
       // drawn gain envelope
-      let out = gn;
       if (c.env && c.env.length) {
-        out = ctx.createGain();
-        gn.connect(out);
+        const eg = ctx.createGain();
+        out.connect(eg);
+        out = eg;
         this.autoSchedule(out.gain, c.env, into, when, 1);
       }
       out.connect(strip.input);
@@ -325,7 +391,21 @@ const Engine = {
       src.buffer = buf;
       src.playbackRate.value = c.rate;
       src.connect(gn);
-      src.start(when, c.offset + into * c.rate, rem * c.rate);
+      // "tape" transitions: the audio spins up from, or winds down to, a near stop
+      const R = src.playbackRate;
+      let off0 = c.offset + into * c.rate;
+      if (inT === 'tape' && fi > 0 && into === 0) {
+        R.setValueAtTime(c.rate * 0.05, when);
+        R.linearRampToValueAtTime(c.rate, when + fi);
+        off0 = Math.min(buf.duration - 0.01, off0 + fi * c.rate * 0.475);   // so the audio after the spin-up stays in time
+      }
+      if (outT === 'tape' && fo > 0) {
+        if (into < fs) R.setValueAtTime(c.rate, when + fs - into);
+        else R.setValueAtTime(c.rate * (1 - 0.95 * (into - fs) / fo), when);
+        R.linearRampToValueAtTime(c.rate * 0.05, when + rem);
+      }
+      src.start(when, off0, rem * c.rate);
+      if (inT === 'tape' || outT === 'tape') src.stop(when + rem);
       if (to != null && end > to) src.stop(t0 + to - from);
       if (sink) this.track(src, sink);
     }
@@ -380,6 +460,8 @@ const Engine = {
     this.t0 = ctx.currentTime + 0.06;
     if (this.mode === 'song') {
       this.scheduleAuto(this.graph, p, this.t0, this.p0);
+      this.fxAuto = this.hasFxAuto(p);
+      if (this.fxAuto) this.applyFxAuto(this.graph, p, this.p0);
       this.scheduleClips(this.graph, p, this.t0, this.p0, null, this.sources);
       this.metroNext = Math.ceil(this.p0 / (60 / p.bpm) - 1e-6);
     } else {
@@ -453,6 +535,7 @@ const Engine = {
       this.halt();
       return;
     }
+    if (this.fxAuto) this.applyFxAuto(this.graph, p, pos + 0.02);
     if (p.metro) {
       const beat = 60 / p.bpm;
       while (this.metroNext * beat < pos + 0.12) {
@@ -487,6 +570,19 @@ const Engine = {
     const g = this.buildGraph(off, p, false);
     this.scheduleAuto(g, p, 0, from);
     this.scheduleClips(g, p, 0, from, to, null);
+    if (this.hasFxAuto(p)) {
+      // effect automation: pause the render every 25 ms across the automated span and move the settings
+      let a = Infinity, b = -Infinity;
+      for (const f of [...p.master.fx, ...p.tracks.flatMap(t => t.fx)]) {
+        for (const pts of Object.values(f.auto || {})) for (const pt of pts) { a = Math.min(a, pt.t); b = Math.max(b, pt.t); }
+      }
+      this.applyFxAuto(g, p, from);
+      const step = 0.025, total = to - from + tail;
+      for (let t = Math.max(step, Math.floor((a - from) / step) * step); t < Math.min(total, b - from + step * 2); t += step) {
+        const at = t;
+        off.suspend(at).then(() => { this.applyFxAuto(g, p, from + at); off.resume(); });
+      }
+    }
     return off.startRendering();
   },
 

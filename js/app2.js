@@ -8,6 +8,7 @@ Object.assign(App, {
   migrate(p) {
     p.v = 2;
     p.markers = p.markers || [];
+    if (p.view.magnet == null) p.view.magnet = true;
     for (const t of p.tracks) {
       t.bus = !!t.bus;
       t.out = t.out || null;
@@ -390,7 +391,7 @@ const Extras = {
       ['V  C  T  D  A', 'Tools: select, slice, mute, delete, automate'], ['S', 'Split clips at the playhead'],
       ['X', 'Crossfade the selected clip with clips it overlaps'], ['M', 'Add a marker at the playhead'],
       ['Ctrl + C / X / V', 'Copy / cut / paste clips'], ['Ctrl + D', 'Duplicate the selection'], ['Ctrl + A', 'Select all clips'],
-      ['Delete', 'Delete the selection'], ['Ctrl + Z / Y', 'Undo / redo'], ['Ctrl + S', 'Save now'],
+      ['Delete', 'Delete the selection'], ['Shift + Delete', 'Ripple delete: remove and close the gap'], ['N', 'Magnet on / off'], ['Ctrl + Z / Y', 'Undo / redo'], ['Ctrl + S', 'Save now'],
       ['+  −', 'Zoom in / out'], ['Ctrl + wheel', 'Zoom at the pointer'], ['Shift + drag ruler', 'Set the loop region'],
       ['Double-click ruler', 'Add a marker'], ['Alt while dragging', 'Ignore snap'], ['Esc', 'Clear the selection'], ['?', 'This list'],
     ];
@@ -432,5 +433,106 @@ const Extras = {
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   navigator.serviceWorker.register('sw.js').catch(() => { /* offline support is optional */ });
 }
+
+Object.assign(App, {
+  // The Automate tool's menu: volume, pan, clip gain, plus every numeric setting of the selected track's effects.
+  syncAutoParams() {
+    const sel = $('#auto-param'), p = this.project, tr = p.tracks.find(t => t.id === this.selTrack);
+    const base = [['vol', 'Track volume'], ['pan', 'Track pan'], ['clip', 'Clip gain']].map(([v, t]) => U.el('option', { value: v, text: t }));
+    const groups = [];
+    for (const f of tr ? tr.fx : []) {
+      const d = FX.defs[f.type];
+      const items = d ? d.params.filter(q => !q.opts && !q.track && !q.noAuto) : [];
+      if (items.length) groups.push(U.el('optgroup', { label: d.name }, items.map(q => U.el('option', { value: 'fx:' + f.id + ':' + q.k, text: d.name + ' · ' + q.label }))));
+    }
+    sel.replaceChildren(...base, ...groups);
+    if (![...sel.options].some(o => o.value === this.autoParam)) this.autoParam = 'vol';
+    sel.value = this.autoParam;
+  },
+
+  toggleMagnet() {
+    const v = this.project.view;
+    v.magnet = !v.magnet;
+    this.syncTop();
+    this.touch();
+    UI.toast(v.magnet ? 'Magnet on — clips snap to clip edges, markers and the playhead' : 'Magnet off');
+  },
+
+  // Delete the selected clips and pull everything after them on the same tracks left to close the gap.
+  rippleDelete() {
+    const p = this.project, gone = this.selected().sort((a, b) => b.start - a.start);
+    if (!gone.length) return;
+    this.edit(() => {
+      p.clips = p.clips.filter(c => !this.sel.has(c.id));
+      for (const g of gone) {
+        const d = g.len / g.rate, end = g.start + d;
+        for (const c of p.clips) if (c.trackId === g.trackId && c.start >= end - 0.001) c.start = Math.max(0, c.start - d);
+      }
+      this.sel.clear();
+    }, 'timeline,clip', true);
+  },
+
+  transitionDialog() {
+    const p = this.project, sel = this.selected(), dur = c => c.len / c.rate, beat = 60 / p.bpm;
+    // each selected clip pairs with the clip that follows it on its track, if that one is close enough to blend into
+    const pairs = [];
+    for (const a of sel) {
+      const next = p.clips.filter(c => c.trackId === a.trackId && c !== a && c.start > a.start).sort((x, y) => x.start - y.start)[0];
+      if (next && next.start - (a.start + dur(a)) < beat * 2) pairs.push([a, next]);
+    }
+    if (!pairs.length) return UI.toast('Select a clip that has another clip right after it on the same track');
+    const style = U.el('select.field', null, [
+      ['smooth', 'Crossfade (smooth, keeps loudness steady)'], ['linear', 'Crossfade (linear)'], ['dip', 'Dip to silence'],
+      ['filter', 'Filter sweep (close, then open)'], ['tape', 'Tape stop, then spin up'],
+    ].map(([v, t]) => U.el('option', { value: v, text: t })));
+    const len = U.el('select.field', null, [[0.5, '1/2 beat'], [1, '1 beat'], [2, '2 beats'], [4, '1 bar'], [8, '2 bars']].map(([v, t]) => U.el('option', { value: v, text: t, selected: v === 2 })));
+    const row = (label, ctl) => U.el('label.form-row', null, U.el('span', { text: label }), ctl);
+    UI.modal({
+      title: 'Transition to next clip',
+      body: U.el('div.form', null,
+        U.el('p', { text: 'Blends ' + (pairs.length > 1 ? pairs.length + ' clips' : 'this clip') + ' into the clip that follows. Crossfades extend both clips into each other when there is spare audio at their edges.' }),
+        row('Style', style), row('Length', len)),
+      actions: [{ label: 'Cancel' }, { label: 'Apply', kind: 'accent', onclick: c => { c(); this.applyTransition(pairs, style.value, +len.value * beat); } }],
+    });
+  },
+
+  applyTransition(pairs, style, D) {
+    const p = this.project, dur = c => c.len / c.rate;
+    const spare = (c, atStart) => {    // seconds of unused audio available beyond the clip's edge
+      if (c.kind === 'pattern') return Infinity;
+      const buf = Engine.buffers.get(c.sampleId);
+      return buf ? (atStart ? c.offset : buf.duration - c.offset - c.len) / c.rate : 0;
+    };
+    this.edit(() => {
+      for (const [a, b] of pairs) {
+        if (style === 'smooth' || style === 'linear') {
+          const need = D - (a.start + dur(a) - b.start);
+          if (need > 0) {
+            let extB = Math.min(spare(b, true), b.start, need / 2);
+            const extA = Math.min(spare(a, false), need - extB);
+            extB = Math.min(spare(b, true), b.start, need - extA);
+            a.len += extA * a.rate;
+            b.start -= extB; b.offset -= extB * b.rate; b.len += extB * b.rate;
+            for (const pt of b.env) pt.t += extB;
+            if (b.kind === 'pattern' && b.offset < 0) {
+              const pat = p.patterns.find(x => x.id === b.patId), L = (pat ? pat.steps : 16) * 60 / p.bpm / 4;
+              b.offset = ((b.offset % L) + L) % L;
+            }
+          }
+          const ov = a.start + dur(a) - b.start;
+          if (ov > 0.01) {
+            a.fadeOut = Math.min(ov, dur(a) - a.fadeIn); a.outType = style;
+            b.fadeIn = Math.min(ov, dur(b) - b.fadeOut); b.inType = style;
+            continue;
+          }
+          style = 'dip';   // no spare audio to overlap: fall back to fading out and back in
+        }
+        const type = style === 'dip' ? 'smooth' : style === 'tape' && (a.kind === 'pattern' || b.kind === 'pattern') ? 'filter' : style;
+        a.fadeOut = Math.min(style === 'tape' ? D : D / 2, dur(a) - a.fadeIn); a.outType = type;
+        b.fadeIn = Math.min(D / 2, dur(b) - b.fadeOut); b.inType = type;
+      }
+    }, 'timeline,clip', true);
+  },
+});
 
 App.init();
